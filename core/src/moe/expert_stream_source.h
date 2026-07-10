@@ -1,6 +1,6 @@
 // Flash-backed expert streaming with an optional LRU cache.
 //
-// Ported from the ShardLLM research streamer. One layer computes at a time, so with the
+// Ported from the original research streamer. One layer computes at a time, so with the
 // cache off the three expert projections share three heap slots (full n_expert size)
 // that every layer's tensors are rebound onto: only the routed slices are ever filled,
 // re-read fresh each token. With the cache on, each (layer, projection) gets its own
