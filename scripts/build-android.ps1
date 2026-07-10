@@ -39,6 +39,7 @@ cmake -S $root -B $buildPath `
     -DCMAKE_BUILD_TYPE="$BuildType" `
     -DBMOE_BUILD_TESTS=OFF `
     -DGGML_NATIVE=OFF `
+    -DGGML_OPENMP=OFF `
     -DGGML_CPU_ARM_ARCH="armv8.2-a+dotprod+i8mm+fp16" `
     -DLLAMA_CURL=OFF
 
