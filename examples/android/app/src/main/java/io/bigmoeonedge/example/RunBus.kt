@@ -1,23 +1,29 @@
 package io.bigmoeonedge.example
 
-import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+
+/** Immutable snapshot of a run, observed by the Compose UI. */
+data class UiState(
+    val running: Boolean = false,
+    val telemetry: Telemetry = Telemetry(),
+    val answer: String = "",
+    val summary: String = "",
+    val error: String? = null,
+)
 
 /**
- * Shared state between the RunService (writer) and MainActivity (reader). The service
- * updates it as CLI output arrives; the UI polls on a short tick. Kept deliberately
- * tiny — a single generation runs at a time.
+ * Single source of truth shared between the RunService (writer) and the UI (reader).
+ * The service pushes updates as CLI output arrives; the UI collects the StateFlow. One
+ * generation runs at a time, so a single flow is enough.
  */
 object RunBus {
-    @Volatile var telemetry: Telemetry = Telemetry()
-    @Volatile var summary: String = ""
-    @Volatile var answer: String = ""
-    @Volatile var error: String? = null
-    val running = AtomicBoolean(false)
+    private val _state = MutableStateFlow(UiState())
+    val state: StateFlow<UiState> = _state.asStateFlow()
 
-    fun reset() {
-        telemetry = Telemetry()
-        summary = ""
-        answer = ""
-        error = null
-    }
+    fun reset() = _state.update { UiState(running = it.running) }
+    fun setRunning(running: Boolean) = _state.update { it.copy(running = running) }
+    fun update(block: (UiState) -> UiState) = _state.update(block)
 }

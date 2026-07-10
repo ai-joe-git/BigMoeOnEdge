@@ -3,129 +3,243 @@ package io.bigmoeonedge.example
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
-import android.widget.ArrayAdapter
-import androidx.appcompat.app.AppCompatActivity
-import androidx.core.app.ActivityCompat
+import android.os.Environment
+import android.provider.Settings
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
-import io.bigmoeonedge.example.databinding.ActivityMainBinding
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import java.io.File
 import java.util.Locale
 
 /**
- * Minimal chat + live telemetry. Pick a pushed .gguf, type a prompt, run: the panel
- * shows tok/s and the per-token compute-vs-flash-I/O split and cache hit rate while the
- * answer streams in. This is the use case that validates ~2 tok/s on a 30B-class MoE.
+ * Minimal chat + live telemetry, in Compose. Pick a pushed .gguf, type a prompt, run:
+ * the panel shows tok/s and the per-token compute-vs-flash-I/O split and cache hit rate
+ * while the answer streams in. This is the use case that validates streaming a
+ * larger-than-RAM MoE on the phone.
  */
-class MainActivity : AppCompatActivity() {
+class MainActivity : ComponentActivity() {
 
-    private lateinit var b: ActivityMainBinding
-    private val ui = Handler(Looper.getMainLooper())
-    private var models: List<File> = emptyList()
-    private val params = Params()
-
-    private val poll = object : Runnable {
-        override fun run() {
-            renderState()
-            ui.postDelayed(this, 250)
-        }
-    }
+    private val requestNotif =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        b = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(b.root)
-
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
             != PackageManager.PERMISSION_GRANTED
         ) {
-            ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+            requestNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
-
-        setupModelSpinner()
-        setupCacheSpinner()
-
-        b.runButton.setOnClickListener { startRun() }
-        b.stopButton.setOnClickListener {
-            startService(Intent(this, RunService::class.java).setAction(RunService.ACTION_STOP))
+        requestAllFilesAccess()
+        setContent {
+            MaterialTheme(colorScheme = if (isSystemDark()) darkColorScheme() else lightColorScheme()) {
+                Surface(color = MaterialTheme.colorScheme.background) { AppScreen() }
+            }
         }
     }
 
-    override fun onResume() {
-        super.onResume()
-        refreshModels()
-        ui.post(poll)
+    // gguf models are read in place from shared storage, which needs all-files access.
+    private fun requestAllFilesAccess() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !Environment.isExternalStorageManager()) {
+            runCatching {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:$packageName"),
+                    )
+                )
+            }
+        }
     }
 
-    override fun onPause() {
-        super.onPause()
-        ui.removeCallbacks(poll)
+    private fun isSystemDark(): Boolean {
+        val flag = resources.configuration.uiMode and
+            android.content.res.Configuration.UI_MODE_NIGHT_MASK
+        return flag == android.content.res.Configuration.UI_MODE_NIGHT_YES
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun AppScreen() {
+    val context = LocalContext.current
+    val ui by RunBus.state.collectAsStateWithLifecycle()
+
+    var models by remember { mutableStateOf(ModelManager.listModels(context)) }
+    var modelIdx by remember { mutableStateOf(0) }
+    var cacheIdx by remember { mutableStateOf(Params.CACHE_CHOICES.indexOf(4000).coerceAtLeast(0)) }
+    var prompt by rememberSaveable { mutableStateOf("Explain what a mixture-of-experts model is, in two sentences.") }
+
+    fun refreshModels() {
+        models = ModelManager.listModels(context)
+        if (modelIdx >= models.size) modelIdx = 0
     }
 
-    private fun setupModelSpinner() {
-        b.modelSpinner.adapter = ArrayAdapter(
-            this, android.R.layout.simple_spinner_dropdown_item, mutableListOf<String>()
+    LaunchedEffect(Unit) { refreshModels() }
+
+    Column(
+        Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("BigMoeOnEdge", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+
+        // model picker
+        if (models.isEmpty()) {
+            ElevatedCard {
+                Text(
+                    ModelManager.pushHint(),
+                    Modifier.padding(12.dp),
+                    fontSize = 13.sp,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+            TextButton(onClick = { refreshModels() }) { Text("Refresh") }
+        } else {
+            LabeledDropdown(
+                label = "Model",
+                options = models.map { it.name },
+                selected = modelIdx.coerceIn(0, models.size - 1),
+                onSelect = { modelIdx = it },
+            )
+        }
+
+        LabeledDropdown(
+            label = "Expert cache",
+            options = Params.CACHE_CHOICES.map { if (it == 0) "off" else "$it MiB" },
+            selected = cacheIdx,
+            onSelect = { cacheIdx = it },
         )
-    }
 
-    private fun setupCacheSpinner() {
-        val labels = Params.CACHE_CHOICES.map { if (it == 0) "off" else "$it MiB" }
-        b.cacheSpinner.adapter =
-            ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, labels)
-        val idx = Params.CACHE_CHOICES.indexOf(params.cacheMb).coerceAtLeast(0)
-        b.cacheSpinner.setSelection(idx)
-    }
+        OutlinedTextField(
+            value = prompt,
+            onValueChange = { prompt = it },
+            label = { Text("Prompt") },
+            modifier = Modifier.fillMaxWidth(),
+            minLines = 2,
+        )
 
-    private fun refreshModels() {
-        models = ModelManager.listModels(this)
-        @Suppress("UNCHECKED_CAST")
-        val adapter = b.modelSpinner.adapter as ArrayAdapter<String>
-        adapter.clear()
-        adapter.addAll(models.map { it.name })
-        adapter.notifyDataSetChanged()
-        b.modelHint.text = if (models.isEmpty()) ModelManager.pushHint(this) else ""
-        b.runButton.isEnabled = models.isNotEmpty()
-    }
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(
+                onClick = {
+                    if (models.isNotEmpty()) {
+                        startRun(context, models[modelIdx.coerceIn(0, models.size - 1)],
+                            prompt.ifBlank { "The capital of Japan is" },
+                            Params(cacheMb = Params.CACHE_CHOICES[cacheIdx]))
+                    }
+                },
+                enabled = !ui.running && models.isNotEmpty(),
+                modifier = Modifier.weight(1f),
+            ) { Text("Run") }
 
-    private fun startRun() {
-        val pos = b.modelSpinner.selectedItemPosition
-        if (pos < 0 || pos >= models.size) return
-        val model = models[pos]
-        val prompt = b.promptInput.text.toString().ifBlank { "The capital of Japan is" }
-        params.cacheMb = Params.CACHE_CHOICES[b.cacheSpinner.selectedItemPosition]
-
-        val argv = ArrayList(params.toArgv(ModelManager.cliPath(this), model.absolutePath, prompt))
-        val intent = Intent(this, RunService::class.java)
-            .putExtra(RunService.EXTRA_MODEL, model.absolutePath)
-            .putExtra(RunService.EXTRA_PROMPT, prompt)
-            .putStringArrayListExtra(RunService.EXTRA_ARGV, argv)
-        ContextCompat.startForegroundService(this, intent)
-
-        RunBus.reset()
-        b.answerView.text = ""
-    }
-
-    private fun renderState() {
-        val running = RunBus.running.get()
-        b.runButton.isEnabled = !running && models.isNotEmpty()
-        b.stopButton.isEnabled = running
-
-        RunBus.error?.let {
-            b.telemetryView.text = "error:\n$it"
-            return
+            OutlinedButton(
+                onClick = {
+                    context.startService(
+                        Intent(context, RunService::class.java).setAction(RunService.ACTION_STOP)
+                    )
+                },
+                enabled = ui.running,
+                modifier = Modifier.weight(1f),
+            ) { Text("Stop") }
         }
 
-        val t = RunBus.telemetry
-        val hit = if (t.cacheHitPct >= 0) String.format(Locale.US, "%.0f%%", t.cacheHitPct) else "—"
-        b.telemetryView.text = String.format(
-            Locale.US,
-            "token %d/%d   %.2f tok/s\ncompute %.0f ms   flash I/O %.0f ms   cache hit %s\n%s",
-            t.step, t.steps, t.tokensPerSecond, t.computeMs, t.ioMs, hit, RunBus.summary
-        )
-        if (RunBus.answer.isNotEmpty()) b.answerView.text = RunBus.answer
+        TelemetryCard(ui)
+
+        if (ui.answer.isNotEmpty()) {
+            SelectionContainer {
+                Text(ui.answer, fontSize = 15.sp)
+            }
+        }
     }
+}
+
+@Composable
+private fun TelemetryCard(ui: UiState) {
+    ElevatedCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            if (ui.error != null) {
+                Text("error", color = MaterialTheme.colorScheme.error, fontWeight = FontWeight.Bold)
+                Text(ui.error, fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+                return@Column
+            }
+            val t = ui.telemetry
+            val hit = if (t.cacheHitPct >= 0) String.format(Locale.US, "%.0f%%", t.cacheHitPct) else "—"
+            Text(
+                String.format(Locale.US, "%.2f tok/s   (token %d/%d)", t.tokensPerSecond, t.step, t.steps),
+                fontWeight = FontWeight.Bold, fontSize = 18.sp,
+            )
+            MeterRow("compute", t.computeMs, t.computeMs + t.ioMs, MaterialTheme.colorScheme.primary)
+            MeterRow("flash I/O", t.ioMs, t.computeMs + t.ioMs, MaterialTheme.colorScheme.tertiary)
+            Text("cache hit $hit", fontSize = 13.sp)
+            if (ui.summary.isNotEmpty()) {
+                Text(ui.summary, fontFamily = FontFamily.Monospace, fontSize = 11.sp)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MeterRow(label: String, value: Double, total: Double, color: androidx.compose.ui.graphics.Color) {
+    val frac = if (total > 0) (value / total).toFloat().coerceIn(0f, 1f) else 0f
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(label, fontSize = 12.sp, modifier = Modifier.width(72.dp))
+        LinearProgressIndicator(
+            progress = { frac },
+            color = color,
+            modifier = Modifier.weight(1f).height(8.dp),
+        )
+        Text(String.format(Locale.US, "%.0f ms", value), fontSize = 12.sp, modifier = Modifier.width(56.dp))
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LabeledDropdown(label: String, options: List<String>, selected: Int, onSelect: (Int) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = options.getOrElse(selected) { "" },
+            onValueChange = {},
+            readOnly = true,
+            label = { Text(label) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier.menuAnchor().fillMaxWidth(),
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            options.forEachIndexed { i, opt ->
+                DropdownMenuItem(text = { Text(opt) }, onClick = { onSelect(i); expanded = false })
+            }
+        }
+    }
+}
+
+private fun startRun(context: android.content.Context, model: File, prompt: String, params: Params) {
+    val argv = ArrayList(params.toArgv(ModelManager.cliPath(context), model.absolutePath, prompt))
+    val intent = Intent(context, RunService::class.java)
+        .putExtra(RunService.EXTRA_MODEL, model.absolutePath)
+        .putExtra(RunService.EXTRA_PROMPT, prompt)
+        .putStringArrayListExtra(RunService.EXTRA_ARGV, argv)
+    ContextCompat.startForegroundService(context, intent)
+    RunBus.reset()
 }

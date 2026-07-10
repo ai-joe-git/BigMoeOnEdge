@@ -38,7 +38,7 @@ class RunService : Service() {
         val argv = intent.getStringArrayListExtra(EXTRA_ARGV) ?: run { finishWithError("no argv"); return START_NOT_STICKY }
 
         RunBus.reset()
-        RunBus.running.set(true)
+        RunBus.setRunning(true)
 
         wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "bmoe:gen").apply { acquire(30 * 60 * 1000L) }
@@ -68,21 +68,27 @@ class RunService : Service() {
             BufferedReader(InputStreamReader(p.inputStream)).useLines { lines ->
                 lines.forEach { line ->
                     if (telemetry.onLine(line)) {
-                        RunBus.telemetry = telemetry.current.copy()
-                        RunBus.summary = telemetry.summary
-                        RunBus.answer = telemetry.current.text
+                        RunBus.update {
+                            it.copy(
+                                telemetry = telemetry.current.copy(),
+                                summary = telemetry.summary,
+                                answer = telemetry.current.text,
+                            )
+                        }
                     }
                 }
             }
 
             val code = p.waitFor()
-            if (code != 0 && RunBus.error == null) {
-                RunBus.error = "bmoe-cli exited $code\n${errTail.takeLast(1200)}"
+            if (code != 0) {
+                RunBus.update {
+                    if (it.error == null) it.copy(error = "bmoe-cli exited $code\n${errTail.takeLast(1200)}") else it
+                }
             }
         } catch (t: Throwable) {
-            RunBus.error = t.message ?: t.toString()
+            RunBus.update { it.copy(error = t.message ?: t.toString()) }
         } finally {
-            RunBus.running.set(false)
+            RunBus.setRunning(false)
             releaseWake()
             stopForegroundCompat()
             stopSelf()
@@ -90,15 +96,14 @@ class RunService : Service() {
     }
 
     private fun finishWithError(msg: String) {
-        RunBus.error = msg
-        RunBus.running.set(false)
+        RunBus.update { it.copy(error = msg, running = false) }
         stopForegroundCompat()
         stopSelf()
     }
 
     private fun stopEverything() {
         proc?.destroy()
-        RunBus.running.set(false)
+        RunBus.setRunning(false)
         releaseWake()
         stopForegroundCompat()
         stopSelf()
