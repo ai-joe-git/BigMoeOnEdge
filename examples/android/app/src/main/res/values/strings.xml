@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BigMoeOnEdge</string>
+    <string name="prompt_hint">Enter a prompt…</string>
+    <string name="run">Run</string>
+    <string name="stop">Stop</string>
+    <string name="cache_label">Expert cache</string>
+    <string name="telemetry_idle">Idle. Pick a model and press Run.</string>
+</resources>

@@ -1,0 +1,146 @@
+package io.bigmoeonedge.example
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.IBinder
+import android.os.PowerManager
+import java.io.BufferedReader
+import java.io.File
+import java.io.InputStreamReader
+import kotlin.concurrent.thread
+
+/**
+ * Runs bmoe-cli as a foreground service so generation survives screen-off. The CLI is a
+ * native executable (shipped as libbmoe-cli.so); we exec it from nativeLibraryDir with
+ * LD_LIBRARY_PATH pointed at the bundled libllama/libggml .so files, and stream its
+ * stdout into the RunBus for the UI to render.
+ */
+class RunService : Service() {
+
+    private val telemetry = TelemetryParser()
+    private var proc: Process? = null
+    private var wake: PowerManager.WakeLock? = null
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP) { stopEverything(); return START_NOT_STICKY }
+
+        startForeground(NOTIF_ID, buildNotification("Generating…"))
+
+        val model = intent?.getStringExtra(EXTRA_MODEL) ?: run { finishWithError("no model"); return START_NOT_STICKY }
+        val prompt = intent.getStringExtra(EXTRA_PROMPT) ?: ""
+        val argv = intent.getStringArrayListExtra(EXTRA_ARGV) ?: run { finishWithError("no argv"); return START_NOT_STICKY }
+
+        RunBus.reset()
+        RunBus.running.set(true)
+
+        wake = (getSystemService(Context.POWER_SERVICE) as PowerManager)
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "bmoe:gen").apply { acquire(30 * 60 * 1000L) }
+
+        thread(name = "bmoe-cli") { runCli(argv, model, prompt) }
+        return START_NOT_STICKY
+    }
+
+    private fun runCli(argv: ArrayList<String>, model: String, prompt: String) {
+        try {
+            val nativeDir = applicationInfo.nativeLibraryDir
+            val pb = ProcessBuilder(argv)
+            pb.redirectErrorStream(false)
+            pb.environment()["LD_LIBRARY_PATH"] = "$nativeDir:/system/lib64:/vendor/lib64"
+            pb.directory(File(model).parentFile)
+
+            val p = pb.start().also { proc = it }
+
+            // Drain stderr so the CLI never blocks on a full pipe; surface the tail on error.
+            val errTail = StringBuilder()
+            thread(name = "bmoe-cli-err") {
+                BufferedReader(InputStreamReader(p.errorStream)).forEachLine {
+                    if (errTail.length < 4000) errTail.append(it).append('\n')
+                }
+            }
+
+            BufferedReader(InputStreamReader(p.inputStream)).useLines { lines ->
+                lines.forEach { line ->
+                    if (telemetry.onLine(line)) {
+                        RunBus.telemetry = telemetry.current.copy()
+                        RunBus.summary = telemetry.summary
+                        RunBus.answer = telemetry.current.text
+                    }
+                }
+            }
+
+            val code = p.waitFor()
+            if (code != 0 && RunBus.error == null) {
+                RunBus.error = "bmoe-cli exited $code\n${errTail.takeLast(1200)}"
+            }
+        } catch (t: Throwable) {
+            RunBus.error = t.message ?: t.toString()
+        } finally {
+            RunBus.running.set(false)
+            releaseWake()
+            stopForegroundCompat()
+            stopSelf()
+        }
+    }
+
+    private fun finishWithError(msg: String) {
+        RunBus.error = msg
+        RunBus.running.set(false)
+        stopForegroundCompat()
+        stopSelf()
+    }
+
+    private fun stopEverything() {
+        proc?.destroy()
+        RunBus.running.set(false)
+        releaseWake()
+        stopForegroundCompat()
+        stopSelf()
+    }
+
+    private fun releaseWake() {
+        wake?.let { if (it.isHeld) it.release() }
+        wake = null
+    }
+
+    private fun stopForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
+        else @Suppress("DEPRECATION") stopForeground(true)
+    }
+
+    override fun onDestroy() {
+        proc?.destroy()
+        releaseWake()
+        super.onDestroy()
+    }
+
+    private fun buildNotification(text: String): Notification {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            nm.createNotificationChannel(
+                NotificationChannel(CHANNEL, "Generation", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
+        return Notification.Builder(this, CHANNEL)
+            .setContentTitle("BigMoeOnEdge")
+            .setContentText(text)
+            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setOngoing(true)
+            .build()
+    }
+
+    companion object {
+        const val ACTION_STOP = "io.bigmoeonedge.example.STOP"
+        const val EXTRA_MODEL = "model"
+        const val EXTRA_PROMPT = "prompt"
+        const val EXTRA_ARGV = "argv"
+        private const val CHANNEL = "gen"
+        private const val NOTIF_ID = 1
+    }
+}
