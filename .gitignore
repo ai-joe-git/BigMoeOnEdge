@@ -1,0 +1,33 @@
+# Build output
+/build*/
+/out/
+cmake-build-*/
+
+# Models and large artifacts (never commit weights)
+*.gguf
+*.bin
+*.safetensors
+
+# Android
+examples/android/.gradle/
+examples/android/build/
+examples/android/app/build/
+examples/android/local.properties
+examples/android/.idea/
+examples/android/app/src/main/jniLibs/**/*.so
+examples/android/captures/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.venv/
