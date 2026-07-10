@@ -27,6 +27,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
@@ -99,15 +101,19 @@ private fun MainScreen(settings: AppSettings, onOpenSettings: () -> Unit) {
     val context = LocalContext.current
     val ui by RunBus.state.collectAsStateWithLifecycle()
 
-    var models by remember { mutableStateOf(ModelManager.listModels(context)) }
+    var models by remember { mutableStateOf<List<File>>(emptyList()) }
+    var scanning by remember { mutableStateOf(true) }
+    var refreshKey by remember { mutableStateOf(0) }
     var modelIdx by remember { mutableStateOf(0) }
     var prompt by rememberSaveable { mutableStateOf("Explain what a mixture-of-experts model is, in two sentences.") }
 
-    fun refreshModels() {
-        models = ModelManager.listModels(context)
+    // Probing gguf headers to keep only MoE models does blocking reads — off the main thread.
+    LaunchedEffect(refreshKey) {
+        scanning = true
+        models = withContext(Dispatchers.IO) { ModelManager.listMoeModels(context) }
         if (modelIdx >= models.size) modelIdx = 0
+        scanning = false
     }
-    LaunchedEffect(Unit) { refreshModels() }
 
     Column(
         Modifier
@@ -121,18 +127,23 @@ private fun MainScreen(settings: AppSettings, onOpenSettings: () -> Unit) {
             TextButton(onClick = onOpenSettings) { Text("Settings") }
         }
 
-        if (models.isEmpty()) {
-            ElevatedCard {
-                Text(
-                    ModelManager.pushHint(),
-                    Modifier.padding(12.dp),
-                    fontSize = 13.sp,
-                    fontFamily = FontFamily.Monospace,
-                )
+        when {
+            scanning -> Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                Text("Scanning for MoE models…", fontSize = 14.sp)
             }
-            TextButton(onClick = { refreshModels() }) { Text("Refresh") }
-        } else {
-            LabeledDropdown(
+            models.isEmpty() -> {
+                ElevatedCard {
+                    Text(
+                        ModelManager.pushHint(),
+                        Modifier.padding(12.dp),
+                        fontSize = 13.sp,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+                TextButton(onClick = { refreshKey++ }) { Text("Refresh") }
+            }
+            else -> LabeledDropdown(
                 label = "Model",
                 options = models.map { it.name },
                 selected = modelIdx.coerceIn(0, models.size - 1),
