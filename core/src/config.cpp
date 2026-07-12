@@ -54,6 +54,12 @@ ValidationResult validate(const RunConfig & cfg) {
             return fail("moe.prefetch_layers requires the LRU cache (cache_mb > 0): speculative reads "
                         "land in the per-layer cache buffers, which do not exist with the cache off.");
         }
+        if (m.spec_gate && m.cache_mb == 0) {
+            return fail("moe.spec_gate requires the LRU cache (cache_mb > 0): its predictions feed the "
+                        "speculative read queue, which caches into the per-layer buffers.");
+        }
+        // Whether the architecture supports speculative gating (a recipe with a router-input node)
+        // is checked in run()/Session::open, where the model and recipe are available.
     }
 
     return r;

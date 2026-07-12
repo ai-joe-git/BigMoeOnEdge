@@ -305,6 +305,7 @@ static void print_usage(const char * argv0) {
                 "      --force-cache       allow a cache-mb in the pathological band\n"
                 "      --overlap           overlap async expert reads with FFN compute (needs the fork)\n"
                 "      --prefetch K        temporally prefetch the next K layers' experts (needs the cache)\n"
+                "      --spec-gate         predict+prefetch the next layer's experts via its router (needs the cache)\n"
                 "      --list-archs        print supported MoE architectures and exit\n"
                 "\n"
                 "  Env overrides (flag wins): BMOE_CACHE_MB, BMOE_IO_THREADS, BMOE_PROGRESS, BMOE_OVERLAP, BMOE_PREFETCH\n",
@@ -363,6 +364,8 @@ int main(int argc, char ** argv) {
             cfg.moe.prefetch_layers = std::atoi(next("--prefetch"));
         else if (a == "--prefetch-sync") // debug: complete speculative reads synchronously
             cfg.moe.prefetch_sync = true;
+        else if (a == "--spec-gate")
+            cfg.moe.spec_gate = true;
         else if (a == "--list-archs") {
             std::printf("supported MoE architectures:\n");
             for (int k = 0; k < n_moe_recipes(); ++k)
@@ -384,6 +387,7 @@ int main(int argc, char ** argv) {
     if (!cfg.progress) cfg.progress = env_int("BMOE_PROGRESS", 0) != 0;
     if (!cfg.moe.overlap) cfg.moe.overlap = env_int("BMOE_OVERLAP", 0) != 0;
     if (cfg.moe.prefetch_layers == 0) cfg.moe.prefetch_layers = env_int("BMOE_PREFETCH", 0);
+    if (!cfg.moe.spec_gate) cfg.moe.spec_gate = env_int("BMOE_SPEC_GATE", 0) != 0;
 
     if (cfg.model_path.empty()) {
         print_usage(argv[0]);
@@ -457,10 +461,12 @@ int main(int argc, char ** argv) {
         if (cfg.moe.overlap)
             std::printf("moe-overlap: stall %.3f s/token (flash reads overlapped with FFN compute)\n",
                         s.moe_stall_s_per_token);
-        if (cfg.moe.prefetch_layers > 0)
+        if (cfg.moe.prefetch_layers > 0 || cfg.moe.spec_gate)
             std::printf("moe-prefetch: %.1f MiB speculative, %lld/%lld experts useful (%.0f%%)\n",
                         s.moe_spec_read_mib, s.moe_spec_useful, s.moe_spec_experts,
                         s.moe_spec_experts > 0 ? 100.0 * s.moe_spec_useful / s.moe_spec_experts : 0.0);
+        if (cfg.moe.spec_gate && s.moe_spec_recall_pct >= 0.0)
+            std::printf("moe-spec-gate: %.0f%% router prediction recall\n", s.moe_spec_recall_pct);
     }
     return 0;
 }

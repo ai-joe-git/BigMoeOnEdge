@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -155,6 +156,27 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg, std::string & 
 
     im.hook = std::make_unique<RouterHook>(recipe ? *recipe : MoeRecipe{}, im.n_layer);
     im.hook->set_prefetch_layers(cfg.moe.prefetch_layers);
+
+    if (cfg.moe.enabled && cfg.moe.spec_gate) {
+        if (!recipe->router_input_fmt)
+            return fail(std::string("--spec-gate is not supported for architecture '") + arch +
+                        "' (no router-input node in its recipe); use --prefetch instead");
+        // n_expert_used (top-k) and the router's rms epsilon come from the model metadata — generic
+        // arch-prefixed gguf keys, so no per-architecture constants leak into the engine.
+        auto meta_int = [&](const std::string & key, int dflt) {
+            char buf[64] = {0};
+            if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf)) >= 0) return std::atoi(buf);
+            return dflt;
+        };
+        auto meta_float = [&](const std::string & key, float dflt) {
+            char buf[64] = {0};
+            if (llama_model_meta_val_str(model, key.c_str(), buf, sizeof(buf)) >= 0) return (float) std::atof(buf);
+            return dflt;
+        };
+        const int n_used = meta_int(std::string(arch) + ".expert_used_count", 8);
+        const float eps = meta_float(std::string(arch) + ".attention.layer_norm_rms_epsilon", 1e-6f);
+        im.hook->set_spec_gate(true, n_used, eps);
+    }
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = cfg.n_ctx;
@@ -345,6 +367,8 @@ RunResult Session::generate(const GenerateRequest & req,
     long long prev_spec_bytes = moe.enabled ? (long long) im.source.stats().spec_read_bytes : 0;
     long long prev_spec_experts = moe.enabled ? im.source.stats().spec_experts : 0;
     long long prev_spec_useful = moe.enabled ? im.source.stats().spec_useful : 0;
+    long long prev_pred_total = im.hook ? im.hook->spec_pred_total() : 0;
+    long long prev_pred_hit = im.hook ? im.hook->spec_pred_hit() : 0;
 
     uint64_t gen_read_bytes = 0;
     double gen_io_seconds = 0.0;
@@ -437,6 +461,11 @@ RunResult Session::generate(const GenerateRequest & req,
         s.moe_spec_read_mib = ((long long) st.spec_read_bytes - prev_spec_bytes) / (1024.0 * 1024.0);
         s.moe_spec_experts = st.spec_experts - prev_spec_experts;
         s.moe_spec_useful = st.spec_useful - prev_spec_useful;
+        if (moe.spec_gate && im.hook) {
+            const long long pt = im.hook->spec_pred_total() - prev_pred_total;
+            const long long ph = im.hook->spec_pred_hit() - prev_pred_hit;
+            s.moe_spec_recall_pct = pt > 0 ? 100.0 * ph / pt : -1.0;
+        }
     }
     if (sink) sink->on_summary(s);
 

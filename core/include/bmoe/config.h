@@ -45,6 +45,13 @@ struct MoeStreamConfig {
     // cache_mb == 0. See docs/prefetch.md.
     int prefetch_layers = 0;
 
+    // Speculative gating: predict the next MoE layer's experts by running its router on the
+    // current layer's hidden state, and prefetch them (a sharper predictor than temporal, at the
+    // cost of isolating one extra graph node per layer). Feeds the same prefetch queue, so a
+    // mispredict only wastes a read. Needs the LRU cache and an architecture wired for it (a
+    // recipe with a router-input node); run() fails fast otherwise. See docs/spec-gating.md.
+    bool spec_gate = false;
+
     // Test/debug only: complete each prefetch's speculative reads synchronously, on the eval
     // thread, before returning. This defeats the latency-hiding purpose (the reads no longer
     // overlap compute) but makes speculative integration deterministic, so the byte-identity
