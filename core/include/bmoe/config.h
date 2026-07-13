@@ -52,6 +52,15 @@ struct MoeStreamConfig {
     // recipe with a router-input node); run() fails fast otherwise. See docs/spec-gating.md.
     bool spec_gate = false;
 
+    // Speculative gating self-governor. Prediction is only worth its I/O and CPU when the router
+    // it forecasts is actually predictable; on some architectures it is not (e.g. a model whose
+    // routing barely correlates across layers). Once at least spec_recall_warmup predictions have
+    // been scored — enough to look past prompt-transition noise — if the running recall is below
+    // spec_recall_min_pct, spec-gating disables itself for the rest of the run (which also drops
+    // the extra per-layer graph barrier). Set spec_recall_min_pct = 0 to never auto-disable.
+    int spec_recall_min_pct = 75;
+    int spec_recall_warmup = 512;
+
     // Test/debug only: complete each prefetch's speculative reads synchronously, on the eval
     // thread, before returning. This defeats the latency-hiding purpose (the reads no longer
     // overlap compute) but makes speculative integration deterministic, so the byte-identity

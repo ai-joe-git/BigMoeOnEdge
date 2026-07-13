@@ -178,6 +178,7 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg, std::string & 
         // prefetch_sync (test-only) keeps prediction inline on the eval thread so the
         // predict → prefetch → integrate → hit path stays deterministic for the byte-identity gates.
         im.hook->set_spec_gate(true, n_used, eps, cfg.moe.prefetch_sync);
+        im.hook->set_spec_autooff(cfg.moe.spec_recall_min_pct, cfg.moe.spec_recall_warmup);
     }
 
     llama_context_params cparams = llama_context_default_params();
@@ -468,6 +469,7 @@ RunResult Session::generate(const GenerateRequest & req,
             const long long pt = im.hook->spec_pred_total() - prev_pred_total;
             const long long ph = im.hook->spec_pred_hit() - prev_pred_hit;
             s.moe_spec_recall_pct = pt > 0 ? 100.0 * ph / pt : -1.0;
+            s.moe_spec_auto_off = im.hook->spec_auto_disabled();
         }
     }
     if (sink) sink->on_summary(s);

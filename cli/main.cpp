@@ -322,6 +322,7 @@ static void print_usage(const char * argv0) {
         "      --overlap           overlap async expert reads with FFN compute (needs the fork)\n"
         "      --prefetch K        temporally prefetch the next K layers' experts (needs the cache)\n"
         "      --spec-gate         predict+prefetch the next layer's experts via its router (needs the cache)\n"
+        "      --spec-recall-min P auto-disable --spec-gate below P%% router recall (default 75, 0=never)\n"
         "      --list-archs        print supported MoE architectures and exit\n"
         "\n"
         "  Env overrides (flag wins): BMOE_CACHE_MB, BMOE_IO_THREADS, BMOE_PROGRESS, BMOE_OVERLAP, BMOE_PREFETCH\n",
@@ -382,6 +383,8 @@ int main(int argc, char ** argv) {
             cfg.moe.prefetch_sync = true;
         else if (a == "--spec-gate")
             cfg.moe.spec_gate = true;
+        else if (a == "--spec-recall-min") // auto-disable spec-gating below this recall %% (0 = never)
+            cfg.moe.spec_recall_min_pct = std::atoi(next("--spec-recall-min"));
         else if (a == "--list-archs") {
             std::printf("supported MoE architectures:\n");
             for (int k = 0; k < n_moe_recipes(); ++k)
@@ -481,8 +484,13 @@ int main(int argc, char ** argv) {
             std::printf("moe-prefetch: %.1f MiB speculative, %lld/%lld experts useful (%.0f%%)\n", s.moe_spec_read_mib,
                         s.moe_spec_useful, s.moe_spec_experts,
                         s.moe_spec_experts > 0 ? 100.0 * s.moe_spec_useful / s.moe_spec_experts : 0.0);
-        if (cfg.moe.spec_gate && s.moe_spec_recall_pct >= 0.0)
-            std::printf("moe-spec-gate: %.0f%% router prediction recall\n", s.moe_spec_recall_pct);
+        if (cfg.moe.spec_gate && s.moe_spec_recall_pct >= 0.0) {
+            if (s.moe_spec_auto_off)
+                std::printf("moe-spec-gate: %.0f%% router prediction recall (auto-disabled below %d%%)\n",
+                            s.moe_spec_recall_pct, cfg.moe.spec_recall_min_pct);
+            else
+                std::printf("moe-spec-gate: %.0f%% router prediction recall\n", s.moe_spec_recall_pct);
+        }
     }
     return 0;
 }

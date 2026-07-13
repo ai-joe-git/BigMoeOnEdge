@@ -162,6 +162,19 @@ bool RouterHook::on_eval(ggml_tensor * t, bool ask) {
             spec_pred_hit_ += hit;
             spec_pred_total_ += (long long) spec_pred_[il].size();
             spec_pred_[il].clear();
+
+            // Recall self-governor: once enough predictions have been scored, if the predictor is
+            // not paying its way, disable spec-gating for the rest of the run. Latching spec_disabled_
+            // also stops isolating the router-input node, so the extra per-layer barrier goes away.
+            if (!spec_disabled_ && spec_recall_min_pct_ > 0 && spec_pred_total_ >= spec_recall_warmup_ &&
+                spec_pred_hit_ * 100 < spec_pred_total_ * spec_recall_min_pct_) {
+                spec_disabled_ = true;
+                spec_auto_off_ = true;
+                std::fprintf(stderr,
+                             "bmoe: speculative gating auto-disabled — %lld%% router prediction recall "
+                             "below the %d%% threshold over %lld predictions\n",
+                             spec_pred_hit_ * 100 / spec_pred_total_, spec_recall_min_pct_, spec_pred_total_);
+            }
         }
 
         // Temporal prefetch: hint the next K layers with what the PREVIOUS token routed there,

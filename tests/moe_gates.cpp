@@ -282,6 +282,20 @@ int main(int argc, char ** argv) {
     }
     fails += check("G6b spec-gate(sync predict+integrate+hit) == streaming(cache off)", s_s0, s_sg_sync);
 
+    // The recall self-governor can disable spec-gating partway through a run; that on→off transition
+    // must not change bytes. A 100% recall floor with a short warm-up guarantees the latch fires on
+    // the tiny model (its near-random cross-layer routing gives well-below-100% recall), so this
+    // exercises generation that starts with spec-gating on and finishes with it off.
+    RunConfig sg_off = sg;
+    sg_off.moe.spec_recall_min_pct = 100;
+    sg_off.moe.spec_recall_warmup = 8;
+    std::string s_sg_off;
+    if (!gen(sg_off, s_sg_off, err)) {
+        std::fprintf(stderr, "spec-gate(auto-off) run failed: %s\n", err.c_str());
+        return 2;
+    }
+    fails += check("G6d spec-gate(recall auto-off mid-run) == streaming(cache off)", s_s0, s_sg_off);
+
 #ifdef BMOE_HAVE_EXPERT_READY_HOOK
     RunConfig sg_ov = sg;
     sg_ov.moe.overlap = true;

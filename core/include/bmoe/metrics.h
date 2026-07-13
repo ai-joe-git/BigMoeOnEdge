@@ -56,6 +56,7 @@ struct RunSummary {
     // Speculative gating (--spec-gate): fraction of predicted experts a later routing actually
     // selected (-1 when spec-gating is off). Measures the predictor, not the streaming path.
     double moe_spec_recall_pct = -1.0;
+    bool moe_spec_auto_off = false; // the recall self-governor disabled spec-gating during the run
 };
 
 // Optional per-token sink (e.g. CSV for benchmarks). The engine calls on_token for each

@@ -58,6 +58,12 @@ ValidationResult validate(const RunConfig & cfg) {
             return fail("moe.spec_gate requires the LRU cache (cache_mb > 0): its predictions feed the "
                         "speculative read queue, which caches into the per-layer buffers.");
         }
+        if (m.spec_recall_min_pct < 0 || m.spec_recall_min_pct > 100) {
+            return fail("moe.spec_recall_min_pct must be in [0, 100] (0 disables the recall self-check)");
+        }
+        if (m.spec_recall_warmup < 0) {
+            return fail("moe.spec_recall_warmup must be >= 0");
+        }
         // Whether the architecture supports speculative gating (a recipe with a router-input node)
         // is checked in run()/Session::open, where the model and recipe are available.
     }

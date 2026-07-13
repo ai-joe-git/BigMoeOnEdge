@@ -60,10 +60,21 @@ public:
     // is dispatched to a dedicated worker thread so it does not inflate the eval-thread decode time.
     void set_spec_gate(bool on, int n_expert_used, float rms_eps, bool sync);
 
+    // Recall self-governor: after `warmup` scored predictions, if cumulative recall is below
+    // `min_pct`, spec-gating disables itself for the rest of the run. min_pct == 0 disables the
+    // check. Set before streaming begins.
+    void set_spec_autooff(int min_pct, long long warmup) {
+        spec_recall_min_pct_ = min_pct;
+        spec_recall_warmup_ = warmup;
+    }
+
     // Speculative-gating prediction accuracy (cumulative): how many predicted experts a later
     // routing actually used, over how many predicted. Read by the runtime for telemetry.
     long long spec_pred_total() const { return spec_pred_total_; }
     long long spec_pred_hit() const { return spec_pred_hit_; }
+
+    // True if the recall self-governor turned spec-gating off mid-run (for the summary line).
+    bool spec_auto_disabled() const { return spec_auto_off_; }
 
 private:
     bool on_eval(ggml_tensor * t, bool ask);
@@ -108,6 +119,9 @@ private:
     std::vector<int> next_moe_layer_;             // next bound MoE layer after il, or -1
     std::vector<std::vector<int32_t>> spec_pred_; // predicted experts per layer, for recall scoring
     long long spec_pred_total_ = 0, spec_pred_hit_ = 0;
+    int spec_recall_min_pct_ = 0;       // 0 = self-governor off
+    long long spec_recall_warmup_ = 0;  // predictions to score before the recall check arms
+    bool spec_auto_off_ = false;        // set once when the self-governor disables spec-gating
 
     // Prediction worker. The eval thread posts a latest-wins request (hidden-state snapshot + target
     // layer); the worker computes the top-k and posts it back in a single-slot mailbox that the eval
