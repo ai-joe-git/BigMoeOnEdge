@@ -47,7 +47,11 @@ class RunService : Service() {
     private val main = Handler(Looper.getMainLooper())
     private val idleUnload = Runnable { shutdownSession() }
 
-    private data class Req(val prompt: String, val nPredict: Int, val think: Boolean)
+    // The prompt of the in-flight generation, so onDone can commit the completed turn's answer
+    // against the question that produced it.
+    @Volatile private var inFlightPrompt: String = ""
+
+    private data class Req(val prompt: String, val nPredict: Int, val think: Boolean, val clearKv: Boolean)
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -74,15 +78,20 @@ class RunService : Service() {
             if (req != null) sendGenerate(req)
             return
         }
-        // Different model/settings (or nothing running): tear down and start fresh.
+        // Different model/settings (or nothing running): tear down and start fresh. A fresh session
+        // has an empty KV, so its first turn always clears; and the conversation starts over.
         killProcess()
         shuttingDown = false
-        pending = req
+        pending = req?.copy(clearKv = true)
         sessionSig = sig
         main.removeCallbacks(idleUnload)
 
+        val streaming = argv.contains("--moe-stream")
         startForeground(NOTIF_ID, buildNotification("Loading model…"))
-        RunBus.update { it.copy(state = EngineState.LOADING, error = null, sessionSig = sig, answer = "", summary = "") }
+        RunBus.update {
+            it.copy(state = EngineState.LOADING, error = null, sessionSig = sig, answer = "", summary = "",
+                transcript = emptyList(), streaming = streaming)
+        }
 
         thread(name = "bmoe-session") { runSession(argv, model) }
     }
@@ -182,21 +191,41 @@ class RunService : Service() {
             val tokS = o.optDouble("tok_s")
             val hit = o.optDouble("cache_hit_pct", -1.0)
             val prefill = o.optDouble("prefill_s")
+            val nPrompt = o.optInt("n_prompt", -1)
+            val nPast = o.optInt("n_past", -1)
             val cancelled = o.optBoolean("cancelled")
             val text = o.optString("text")
+            val loc = java.util.Locale.US
             val summary = buildString {
-                append(String.format(java.util.Locale.US, "generation: %d tokens (%.2f tok/s)", tokens, tokS))
-                if (prefill > 0) append(String.format(java.util.Locale.US, " | prefill %.2fs", prefill))
-                if (hit >= 0) append(String.format(java.util.Locale.US, " | cache %.0f%%", hit))
+                append(String.format(loc, "generation: %d tokens (%.2f tok/s)", tokens, tokS))
+                if (prefill > 0) append(String.format(loc, " | prefill %.2fs", prefill))
+                if (hit >= 0) append(String.format(loc, " | cache %.0f%%", hit))
                 if (cancelled) append(" | cancelled")
+            }
+            // Compact one-line metrics shown under this turn's answer in the transcript.
+            val turnMetrics = buildString {
+                append(String.format(loc, "%.1f tok/s · %d tok", tokS, tokens))
+                if (prefill > 0) {
+                    append(String.format(loc, " · prefill %.1fs", prefill))
+                    if (nPrompt >= 0) append(String.format(loc, " (%d tok)", nPrompt))
+                }
+                if (nPast >= 0) append(String.format(loc, " · ctx %d/%d", nPast, AppSettings.SESSION_CTX))
+                if (hit >= 0) append(String.format(loc, " · cache %.0f%%", hit))
+                if (cancelled) append(" · cancelled")
             }
             val tel = telemetry.current.copy(avgTokensPerSecond = tokS)
             RunBus.update {
-                it.copy(state = EngineState.READY, telemetry = tel,
-                    answer = if (text.isNotEmpty()) text else it.answer, summary = summary)
+                val answer = if (text.isNotEmpty()) text else it.answer
+                // Commit the assistant turn (skip a cancelled empty turn); the user turn was added on send.
+                val transcript =
+                    if (answer.isNotEmpty() || !cancelled) it.transcript + ChatTurn("assistant", answer, turnMetrics)
+                    else it.transcript
+                it.copy(state = EngineState.READY, telemetry = tel, answer = "", summary = summary,
+                    transcript = transcript)
             }
         }
         releaseWake()
+        inFlightPrompt = ""
         main.post { notify("Model ready") }
         scheduleIdleUnload()
     }
@@ -222,15 +251,22 @@ class RunService : Service() {
         prompt = intent.getStringExtra(EXTRA_PROMPT) ?: "",
         nPredict = intent.getIntExtra(EXTRA_NPREDICT, 48),
         think = intent.getBooleanExtra(EXTRA_THINK, false),
+        clearKv = intent.getBooleanExtra(EXTRA_CLEAR_KV, true),
     )
 
     private fun sendGenerate(req: Req) {
         val id = nextId++
+        inFlightPrompt = req.prompt
+        // Show the user's turn immediately. clear_kv = "new chat" resets the transcript to this turn.
+        RunBus.update {
+            val user = ChatTurn("user", req.prompt)
+            it.copy(transcript = if (req.clearKv) listOf(user) else it.transcript + user, answer = "")
+        }
         val json = buildString {
             append("""{"cmd":"generate","id":""").append(id)
             append(""","n_predict":""").append(req.nPredict)
             append(""","think":""").append(req.think)
-            append(""","clear_kv":true""")
+            append(""","clear_kv":""").append(req.clearKv)
             append(""","prompt":"""").append(jsonEscape(req.prompt)).append("\"}")
         }
         if (!send(json)) fail("session not ready")
@@ -332,6 +368,7 @@ class RunService : Service() {
         const val EXTRA_PROMPT = "prompt"
         const val EXTRA_NPREDICT = "n_predict"
         const val EXTRA_THINK = "think"
+        const val EXTRA_CLEAR_KV = "clear_kv"
         private const val CHANNEL = "gen"
         private const val NOTIF_ID = 1
 
