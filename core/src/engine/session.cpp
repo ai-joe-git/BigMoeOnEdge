@@ -395,8 +395,7 @@ RunResult Session::generate(const GenerateRequest & req,
     size_t n_common = 0;
     if (chat_on && !im.kv_tokens.empty()) {
         const size_t max_common = tokens.size() > 0 ? tokens.size() - 1 : 0;
-        while (n_common < im.kv_tokens.size() && n_common < max_common &&
-               im.kv_tokens[n_common] == tokens[n_common])
+        while (n_common < im.kv_tokens.size() && n_common < max_common && im.kv_tokens[n_common] == tokens[n_common])
             ++n_common;
         if (n_common < im.kv_tokens.size()) {
             // SWA-style memory (e.g. Gemma) can refuse a partial removal; fall back to a full
@@ -443,7 +442,8 @@ RunResult Session::generate(const GenerateRequest & req,
     }
     // The suffix is now in the KV; record it so the next turn can diff against it.
     if (chat_on)
-        for (int i = (int) n_common; i < n_prompt; ++i) im.kv_tokens.push_back(tokens[i]);
+        for (int i = (int) n_common; i < n_prompt; ++i)
+            im.kv_tokens.push_back(tokens[i]);
     const double prefill_seconds = secs(t_prefill0, clock_t_::now());
     const float * logits = llama_get_logits_ith(ctx, -1);
 
