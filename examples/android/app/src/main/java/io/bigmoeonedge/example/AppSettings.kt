@@ -7,17 +7,18 @@ import android.content.Context
  * flags; the Settings screen edits them and [toArgv] builds the command line.
  */
 data class AppSettings(
-    // Defaults are the measured "winning recipe" on an 11-12 GB device: auto cache capped at
-    // ~4.6 GB, 4 read lanes, overlap on. Experimental knobs (prefetch, spec-gate) stay off.
+    // Conservative, device-agnostic defaults: a modest fixed expert cache, streaming with overlap,
+    // 4 compute + 4 read lanes, model's own top-k. No device- or benchmark-specific tuning — the
+    // knobs below let the user tune for their own hardware.
     val mmap: Boolean = false,   // baseline: no streaming — llama.cpp mmap loads the whole model
-    val cacheMb: Int = CACHE_AUTO,// LRU expert cache budget; Auto / 0 / >= 2000 (see CACHE_CHOICES)
-    val cacheCeilMb: Int = 4600, // with cacheMb=Auto: upper bound on the auto budget (0 = no cap)
+    val cacheMb: Int = 3000,     // LRU expert cache budget; Auto / 0 / >= 2000 (see CACHE_CHOICES)
+    val cacheCeilMb: Int = 4000, // with cacheMb=Auto: upper bound on the auto budget (0 = no cap)
     val ioThreads: Int = 4,      // parallel expert-read lanes
-    val threads: Int = 4,        // compute threads (-t); 4 is the measured optimum
+    val threads: Int = 4,        // compute threads (-t)
     val nExpertUsed: Int = 0,    // top-k override (0 = model default); lower = faster, changes output
     val nPredict: Int = 48,
     val oDirect: Boolean = true, // bypass the page cache
-    val overlap: Boolean = true, // read next experts while the layer computes — measured tok/s win
+    val overlap: Boolean = true, // read the next experts while the current layer computes
     val prefetchLayers: Int = 0, // temporal prefetch depth K (0 = off); needs the cache
     val specGate: Boolean = false,// predict next layer's experts via its router; needs the cache
     val thinking: Boolean = false,// reasoning; off passes --no-think (enable_thinking=false)
@@ -95,14 +96,14 @@ data class AppSettings(
         // rejected recoverably by the CLI, leaving the session usable.
         const val SESSION_CTX = 4096
 
-        // -1 (Auto) sizes the cache to the device's free RAM at runtime (--cache-mb auto). 1000 is
-        // deliberately absent: a budget below the ~1500 MiB pathological band thrashes and is slower
-        // than no cache — the engine rejects it. Use Auto, 0, or >= 2000.
+        // -1 (Auto) sizes the cache to the device's free RAM at runtime (--cache-mb auto). Values
+        // between 0 and 2000 are omitted: a very small cache thrashes (evict + re-read) and the
+        // engine rejects it. Use Auto, 0, or >= 2000.
         const val CACHE_AUTO = -1
         val CACHE_CHOICES = intArrayOf(CACHE_AUTO, 0, 2000, 3000, 4000, 5000, 6000)
-        // Upper bound for the Auto budget. 0 = no cap. On a 12 GB device the free-RAM floor makes
-        // ~4.6 GB the measured sweet spot; uncapped Auto over-grows and regresses under pressure.
-        val CACHE_CEIL_CHOICES = intArrayOf(0, 3000, 4000, 4600, 6000)
+        // Upper bound for the Auto budget (0 = no cap). A cap keeps Auto from over-growing into
+        // memory pressure on devices where free RAM is tight.
+        val CACHE_CEIL_CHOICES = intArrayOf(0, 3000, 4000, 5000, 6000)
         val IO_CHOICES = intArrayOf(1, 2, 4, 8)
         // 0 = model default (top-k as trained). 6/4 trade output quality for tok/s (fewer routed experts).
         val N_EXPERT_CHOICES = intArrayOf(0, 6, 4)

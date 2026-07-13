@@ -257,6 +257,17 @@ private fun MainScreen(
                         Text("Loading model…", fontSize = 14.sp)
                     }
                 }
+                // After the model is loaded, the prompt is prefilled before the first token streams
+                // (no BMOE_PROGRESS yet). Signal that phase so a slow prefill does not look stuck.
+                if (ui.generating && ui.telemetry.step == 0) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                        Text("Prefilling prompt…", fontSize = 14.sp)
+                    }
+                }
 
                 TelemetryCard(ui)
             }
@@ -466,9 +477,14 @@ private fun TelemetryCard(ui: UiState) {
             if (ui.streaming) {
                 // The compute-vs-flash split and cache hit rate only mean anything with the streamer
                 // running. Under mmap the model faults in through the OS page cache, invisible here.
+                // Once done, show the per-token AVERAGE split; while generating, the live last token.
+                val useAvg = done && t.avgComputeMs >= 0 && t.avgIoMs >= 0
+                val compute = if (useAvg) t.avgComputeMs else t.computeMs
+                val io = if (useAvg) t.avgIoMs else t.ioMs
+                val suffix = if (useAvg) " avg" else ""
                 val hit = if (t.cacheHitPct >= 0) String.format(Locale.US, "%.0f%%", t.cacheHitPct) else "—"
-                MeterRow("compute", t.computeMs, t.computeMs + t.ioMs, MaterialTheme.colorScheme.primary)
-                MeterRow("flash I/O", t.ioMs, t.computeMs + t.ioMs, MaterialTheme.colorScheme.tertiary)
+                MeterRow("compute$suffix", compute, compute + io, MaterialTheme.colorScheme.primary)
+                MeterRow("flash I/O$suffix", io, compute + io, MaterialTheme.colorScheme.tertiary)
                 Text("cache hit $hit", fontSize = 13.sp)
                 if (ui.ioMode != null) {
                     Text("I/O ${ui.ioMode}", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)

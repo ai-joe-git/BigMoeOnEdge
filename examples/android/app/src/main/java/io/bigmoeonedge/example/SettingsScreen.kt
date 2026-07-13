@@ -62,10 +62,8 @@ fun SettingsScreen(current: AppSettings, onChange: (AppSettings) -> Unit, onBack
                     enabled = stream,
                 ) { onChange(current.copy(cacheMb = it)) }
                 Text(
-                    "Auto sizes the cache to free RAM and shrinks under pressure. Otherwise 0 or " +
-                        "≥ 2000 MiB — a smaller fixed cache thrashes (evict + re-read) and is slower " +
-                        "than off, so 1000 is intentionally not offered. Auto capped at ~4.6 GB is the " +
-                        "measured sweet spot on 12 GB devices.",
+                    "Larger cache = fewer flash reads per token, but more RAM. Auto sizes to free RAM and " +
+                        "shrinks under memory pressure. Fixed values are 0 (off) or ≥ 2000 MiB.",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 IntSetting(
@@ -74,25 +72,25 @@ fun SettingsScreen(current: AppSettings, onChange: (AppSettings) -> Unit, onBack
                     enabled = stream && current.cacheMb == AppSettings.CACHE_AUTO,
                 ) { onChange(current.copy(cacheCeilMb = it)) }
                 Text(
-                    "Upper bound on the Auto budget. Past ~4.6 GB the extra hit rate no longer pays for " +
-                        "the RAM, and uncapped Auto can over-grow into memory pressure and regress.",
+                    "Upper bound on the Auto budget, so it does not grow into memory pressure on " +
+                        "devices with tight free RAM.",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 IntSetting("Parallel I/O lanes", AppSettings.IO_CHOICES, current.ioThreads, enabled = stream) {
                     onChange(current.copy(ioThreads = it))
                 }
                 Text(
-                    "Parallel flash reads per token. 4 is the measured optimum on UFS4 — a real tok/s win.",
+                    "Number of parallel flash-read threads for the expert stream.",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 SwitchRow(
                     "Direct I/O (O_DIRECT)",
-                    "Bypass the page cache for expert reads. Keep on; falls back automatically if unsupported",
+                    "Bypass the page cache for expert reads. Falls back to buffered automatically if unsupported",
                     current.oDirect, enabled = stream,
                 ) { onChange(current.copy(oDirect = it)) }
                 SwitchRow(
                     "I/O–compute overlap",
-                    "Read the next experts while the current layer computes — a measured tok/s win, part of the fast recipe",
+                    "Read the next experts while the current layer computes, hiding read latency",
                     current.overlap, enabled = stream,
                 ) { onChange(current.copy(overlap = it)) }
                 IntSetting(
@@ -101,13 +99,12 @@ fun SettingsScreen(current: AppSettings, onChange: (AppSettings) -> Unit, onBack
                     enabled = stream && cacheOn,
                 ) { onChange(current.copy(prefetchLayers = it)) }
                 Text(
-                    "Experimental. Read the next K layers' likely experts on idle lanes. Measured ±1% on " +
-                        "this hardware (overlap already hides the read) — leave at 0 unless experimenting. Needs the cache on.",
+                    "Experimental. Prefetch the next K layers' likely experts on idle read lanes. Needs the cache on.",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 SwitchRow(
                     "Speculative gating",
-                    "Experimental. Sharper next-layer predictor, but measured to HALVE steady-state tok/s here — off by default",
+                    "Experimental. Predict the next layer's experts by running its router early",
                     current.specGate, enabled = stream && cacheOn,
                 ) { onChange(current.copy(specGate = it)) }
             }
@@ -120,14 +117,13 @@ fun SettingsScreen(current: AppSettings, onChange: (AppSettings) -> Unit, onBack
                     format = {
                         when (it) {
                             0 -> "Model default"
-                            6 -> "6 — turbo (+~23% tok/s)"
-                            else -> "$it — fastest"
+                            else -> "$it"
                         }
                     },
                 ) { onChange(current.copy(nExpertUsed = it)) }
                 Text(
-                    "Route fewer experts per token than the model default (usually 8). +~23% tok/s at 6, " +
-                        "but the output changes — a speed/quality trade-off, not a free win.",
+                    "Route fewer experts per token than the model's default. Faster and lighter on flash, " +
+                        "but the output changes — a speed/quality trade-off.",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }

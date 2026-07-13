@@ -38,6 +38,11 @@ class RunService : Service() {
 
     @Volatile private var sessionSig: String? = null
     @Volatile private var shuttingDown = false
+    // Bumped every time a new session process is (re)started. The runSession thread carries the
+    // epoch it was launched with and only touches shared state (proc, RunBus, foreground) while it
+    // is still current — so an old session being torn down (on a model/settings change) cannot
+    // clobber the fresh session that replaced it with a stale IDLE/ERROR or a nulled process.
+    @Volatile private var epoch = 0
     private var nextId = 1
 
     // A prompt supplied with START_SESSION runs as soon as the process reports READY.
@@ -80,6 +85,10 @@ class RunService : Service() {
         }
         // Different model/settings (or nothing running): tear down and start fresh. A fresh session
         // has an empty KV, so its first turn always clears; and the conversation starts over.
+        // Supersede any old session FIRST (bump epoch before killing its process), so the old
+        // thread — which unblocks the moment we destroy its process — sees a newer epoch in its
+        // finally and skips the cleanup that would otherwise clobber this fresh session.
+        val myEpoch = ++epoch
         killProcess()
         shuttingDown = false
         pending = req?.copy(clearKv = true)
@@ -93,10 +102,13 @@ class RunService : Service() {
                 transcript = emptyList(), streaming = streaming)
         }
 
-        thread(name = "bmoe-session") { runSession(argv, model) }
+        thread(name = "bmoe-session") { runSession(argv, model, myEpoch) }
     }
 
-    private fun runSession(argv: ArrayList<String>, model: String) {
+    /** True while this session thread is still the current one and not shutting down. */
+    private fun current(myEpoch: Int) = epoch == myEpoch && !shuttingDown
+
+    private fun runSession(argv: ArrayList<String>, model: String, myEpoch: Int) {
         try {
             val nativeDir = applicationInfo.nativeLibraryDir
             val pb = ProcessBuilder(argv)
@@ -116,10 +128,10 @@ class RunService : Service() {
                         if (errTail.length < 4000) errTail.append(line).append('\n')
                         when {
                             "O_DIRECT returns wrong data" in line ->
-                                RunBus.update { it.copy(ioMode = "buffered (O_DIRECT unsupported on this storage)") }
+                                if (current(myEpoch)) RunBus.update { it.copy(ioMode = "buffered (O_DIRECT unsupported on this storage)") }
                             "expert streaming ON" in line ->
                                 Regex("""o_direct=(\d)""").find(line)?.groupValues?.get(1)?.let { d ->
-                                    RunBus.update {
+                                    if (current(myEpoch)) RunBus.update {
                                         if (it.ioMode != null) it
                                         else it.copy(ioMode = if (d == "1") "direct (O_DIRECT)" else "buffered")
                                     }
@@ -132,26 +144,31 @@ class RunService : Service() {
             }
 
             BufferedReader(InputStreamReader(p.inputStream)).useLines { lines ->
-                lines.forEach { handleLine(it) }
+                lines.forEach { if (epoch == myEpoch) handleLine(it) }
             }
 
             val code = p.waitFor()
-            if (!shuttingDown && code != 0) {
+            if (current(myEpoch) && code != 0) {
                 RunBus.update {
                     it.copy(state = EngineState.ERROR,
                         error = if (it.error == null) "bmoe-cli exited $code\n${errTail.takeLast(1200)}" else it.error)
                 }
             }
         } catch (t: Throwable) {
-            if (!shuttingDown) RunBus.update { it.copy(state = EngineState.ERROR, error = t.message ?: t.toString()) }
+            if (current(myEpoch)) RunBus.update { it.copy(state = EngineState.ERROR, error = t.message ?: t.toString()) }
         } finally {
-            releaseWake()
-            procWriter = null
-            proc = null
-            if (!shuttingDown) RunBus.update { if (it.state != EngineState.ERROR) it.copy(state = EngineState.IDLE, sessionSig = null) else it.copy(sessionSig = null) }
-            main.post {
-                stopForegroundCompat()
-                stopSelf()
+            // A superseded thread (a newer session took over on a model/settings change) must not
+            // touch the shared process handles, the UI state, or the foreground service — the new
+            // session owns them now.
+            if (epoch == myEpoch) {
+                releaseWake()
+                procWriter = null
+                proc = null
+                if (!shuttingDown) RunBus.update { if (it.state != EngineState.ERROR) it.copy(state = EngineState.IDLE, sessionSig = null) else it.copy(sessionSig = null) }
+                main.post {
+                    stopForegroundCompat()
+                    stopSelf()
+                }
             }
         }
     }
@@ -193,6 +210,8 @@ class RunService : Service() {
             val prefill = o.optDouble("prefill_s")
             val nPrompt = o.optInt("n_prompt", -1)
             val nPast = o.optInt("n_past", -1)
+            val avgComputeMs = o.optDouble("compute_s_tok", -0.001) * 1000.0
+            val avgIoMs = o.optDouble("io_s_tok", -0.001) * 1000.0
             val cancelled = o.optBoolean("cancelled")
             val text = o.optString("text")
             val loc = java.util.Locale.US
@@ -213,7 +232,7 @@ class RunService : Service() {
                 if (hit >= 0) append(String.format(loc, " · cache %.0f%%", hit))
                 if (cancelled) append(" · cancelled")
             }
-            val tel = telemetry.current.copy(avgTokensPerSecond = tokS)
+            val tel = telemetry.current.copy(avgTokensPerSecond = tokS, avgComputeMs = avgComputeMs, avgIoMs = avgIoMs)
             RunBus.update {
                 val answer = if (text.isNotEmpty()) text else it.answer
                 // Commit the assistant turn (skip a cancelled empty turn); the user turn was added on send.
