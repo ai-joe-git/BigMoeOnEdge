@@ -422,7 +422,7 @@ void ExpertStreamSource::quiesce_spec() {
         cspec_[id] = 1;  // speculative until a real lookup hits it (then counted useful)
         cstamp_[id] = 0; // not used this generation → evictable if the budget is tight
         cresident_ += entry_bytes(id / n_expert_);
-        lru_push_front(id);
+        lru_push_back(id); // cold end: a mispredicted expert is reclaimed before any demanded one
         spec_experts_.fetch_add(1);
     }
     // Release pages of entries that never finished (a cancelled or failed read).
@@ -454,6 +454,17 @@ void ExpertStreamSource::lru_push_front(int32_t id) {
     else
         ctail_ = id;
     chead_ = id;
+}
+// Insert at the LRU (cold) end. Speculative entries enter here so a wrong prediction is the first
+// thing evicted and can never displace a demanded expert; a real lookup promotes it to the front.
+void ExpertStreamSource::lru_push_back(int32_t id) {
+    cnext_[id] = -1;
+    cprev_[id] = ctail_;
+    if (ctail_ != -1)
+        cnext_[ctail_] = id;
+    else
+        chead_ = id;
+    ctail_ = id;
 }
 size_t ExpertStreamSource::entry_bytes(int il) const {
     const LayerExperts & L = layers_[il];
