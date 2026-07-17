@@ -34,12 +34,10 @@ bool ExpertStreamSource::init(const std::string & gguf_path,
     n_expert_ = n_expert;
     layers_ = std::move(layers);
     n_layer_ = (int) layers_.size();
-    o_direct_ = cfg.o_direct;
     load_all_ = cfg.load_all;
     overlap_ = cfg.overlap;
     prefetch_sync_ = cfg.prefetch_sync && !cfg.overlap; // serial only: overlap lane 0 is a worker
     cache_dynamic_ = cfg.cache_dynamic;
-    dense_odirect_ = cfg.dense_odirect;
     cache_max_ = (size_t) std::max(0, cfg.cache_mb) * 1024ull * 1024ull;
     io_threads_ = std::max(1, std::min(MoeStreamConfig::io_threads_max, cfg.io_threads));
 
@@ -150,71 +148,12 @@ bool ExpertStreamSource::init(const std::string & gguf_path,
         clookups_ = 0;
     }
 
-    // Read pool: a private fd + bounce per lane so concurrent preads never contend.
+    // Read pool: the reader owns a private fd + bounce per lane so concurrent preads never contend,
+    // and the O_DIRECT request + its verify/fallback. The dense-weights loader opens its own reader,
+    // so its cache-bypass choice is independent of this one.
     const size_t max_slice = max_full_any / (size_t) n_expert_;
     const size_t bounce_cap = max_slice + 2 * align_;
-
-    pio::fd_t primary = pio::open_read(gguf_path.c_str(), o_direct_);
-    if (!pio::fd_ok(primary) && o_direct_) {
-        o_direct_ = false;
-        primary = pio::open_read(gguf_path.c_str(), false);
-    }
-    if (!pio::fd_ok(primary)) {
-        std::fprintf(stderr, "bmoe: open %s failed\n", gguf_path.c_str());
-        return false;
-    }
-    fsize_ = pio::file_size(primary);
-
-    // Verify O_DIRECT actually returns correct bytes on this storage. On some emulated / FUSE-backed
-    // volumes (e.g. an app-private dir under /storage/emulated) the open SUCCEEDS but direct reads
-    // return garbage, silently corrupting expert weights → nonsense output. Compare one aligned
-    // block read directly against the same block read buffered; on any mismatch, fall back to
-    // buffered I/O for this file. On real filesystems (adb-pushed models, desktop) the two match
-    // and O_DIRECT is kept.
-    if (o_direct_ && fsize_ >= (uint64_t) align_) {
-        uint64_t voff = (fsize_ / 2) & ~(uint64_t) (align_ - 1);
-        if (voff + align_ > fsize_) voff = 0;
-        void * dbuf = pio::alloc_aligned(align_, align_);
-        pio::fd_t vfd = pio::open_read(gguf_path.c_str(), false);
-        if (dbuf && pio::fd_ok(vfd)) {
-            std::vector<char> bbuf(align_);
-            const long long want = (long long) align_;
-            const long long gd = pio::pread_at(primary, dbuf, align_, voff);
-            const long long gb = pio::pread_at(vfd, bbuf.data(), align_, voff);
-            const bool bad = gd != want || gb != want || std::memcmp(dbuf, bbuf.data(), align_) != 0;
-            if (bad) {
-                std::fprintf(stderr, "bmoe: O_DIRECT returns wrong data on this storage — using buffered I/O\n");
-                o_direct_ = false;
-                pio::close_fd(primary);
-                primary = pio::open_read(gguf_path.c_str(), false);
-            }
-        }
-        if (dbuf) pio::aligned_free(dbuf);
-        if (pio::fd_ok(vfd)) pio::close_fd(vfd);
-        if (!pio::fd_ok(primary)) {
-            std::fprintf(stderr, "bmoe: reopen after O_DIRECT check failed\n");
-            return false;
-        }
-    }
-
-    fds_.assign(io_threads_, pio::fd_invalid);
-    fds_buf_.assign(io_threads_, pio::fd_invalid);
-    bounces_.assign(io_threads_, nullptr);
-    bounce_sz_.assign(io_threads_, 0);
-    for (int lane = 0; lane < io_threads_; ++lane) {
-        fds_[lane] = (lane == 0) ? primary : pio::open_read(gguf_path.c_str(), o_direct_);
-        fds_buf_[lane] = o_direct_ ? pio::open_read(gguf_path.c_str(), false) : pio::fd_invalid;
-        if (!pio::fd_ok(fds_[lane])) {
-            std::fprintf(stderr, "bmoe: lane %d open failed\n", lane);
-            return false;
-        }
-        bounces_[lane] = pio::alloc_aligned(align_, bounce_cap);
-        if (!bounces_[lane]) {
-            std::fprintf(stderr, "bmoe: lane %d bounce alloc failed\n", lane);
-            return false;
-        }
-        bounce_sz_[lane] = bounce_cap;
-    }
+    if (!reader_.open(gguf_path, io_threads_, cfg.o_direct, align_, bounce_cap)) return false;
 
     seen_.assign(n_expert_, 0);
     jobs_.reserve((size_t) n_expert_ * MoeRecipe::max_exps);
@@ -245,11 +184,12 @@ bool ExpertStreamSource::init(const std::string & gguf_path,
         }
     }
 
-    // The dense byte ranges are the complement of the expert ranges in the file — the same set
-    // warm_dense_regions sweeps. Kept here so the dense-residency sensor can find them at runtime
-    // without recomputing; the path is kept alongside to locate the mmap in /proc/self/maps.
-    gguf_path_ = gguf_path;
-    if (cache_dynamic_) {
+    // Hand the dense (non-expert) weights to their policy module: it warms them into the page cache,
+    // or reads them into anon buffers and rebinds, and owns the residency sensor — all on the caller's
+    // thread before the workers start (the Anonymous mode rebinds tensor->data). The dense byte ranges
+    // are the complement of the expert ranges in the file, computed once here and shared by the warm
+    // sweep and the sensor.
+    {
         std::vector<std::pair<uint64_t, uint64_t>> exp;
         for (const LayerExperts & L : layers_) {
             if (!L.bound) continue;
@@ -258,29 +198,12 @@ bool ExpertStreamSource::init(const std::string & gguf_path,
                 if (sz) exp.push_back({L.proj[p].file_off, L.proj[p].file_off + sz});
             }
         }
-        std::sort(exp.begin(), exp.end());
-        uint64_t pos = 0;
-        for (const auto & r : exp) {
-            if (r.first > pos) dense_ranges_.push_back({pos, r.first});
-            pos = std::max(pos, r.second);
+        auto ranges = DenseWeights::byte_ranges(std::move(exp), reader_.file_size());
+        if (!dense_.init(cfg.dense_weights, gguf_path, align_, std::move(ranges), std::move(dense_tensors_))) {
+            std::fprintf(stderr, "bmoe: dense-weights init failed\n");
+            return false;
         }
-        if (pos < fsize_) dense_ranges_.push_back({pos, fsize_});
     }
-
-    // --dense-odirect: read the dense weights into our own anon buffers and rebind their tensors,
-    // once, on lane 0 while it is still the caller's thread and no worker is running. Must precede
-    // warm_dense (which becomes pointless — the dense is no longer mmap'd) and the workers.
-    if (dense_odirect_ && !dense_tensors_.empty() && !read_dense_odirect()) {
-        std::fprintf(stderr, "bmoe: --dense-odirect read failed\n");
-        return false;
-    }
-
-    // Warm the dense (non-expert) regions into the page cache before the first token, so the early
-    // decodes do not fault them in one scattered 4 KiB page at a time. Independent of the cache
-    // budget: it only pre-faults the mmap-resident pages, it neither pins nor reserves them. Runs on
-    // the caller's thread (the workers are not started yet). Skipped under --dense-odirect: those
-    // weights are our anon buffers now, not the mmap this would warm.
-    if (cfg.warm_dense && !dense_odirect_) warm_dense_regions(gguf_path);
 
     active_ = true;
     // Serial: lane 0 is the calling thread (it drains inline), workers own lanes 1..N-1.
@@ -291,197 +214,32 @@ bool ExpertStreamSource::init(const std::string & gguf_path,
         io_pool_.emplace_back(&ExpertStreamSource::io_worker, this, lane);
 
     std::fprintf(stderr, "bmoe: expert streaming ON  n_expert=%d o_direct=%d io_threads=%d cache=%zu MiB\n", n_expert_,
-                 (int) o_direct_, io_threads_, cache_max_ >> 20);
-    return true;
-}
-
-// ── dense warm-up: sequentially page-cache everything that is not an expert tensor ──
-void ExpertStreamSource::warm_dense_regions(const std::string & gguf_path) {
-    // The complement of the expert byte ranges is the dense set: gguf header/metadata plus every
-    // tensor the streamer leaves mmap-resident (embeddings, attention, norms, lm_head). Buffered
-    // reads land in the same page cache the mmap is served from, so one sequential sweep here
-    // replaces thousands of random 4 KiB major faults during the first decodes. Best-effort: a read
-    // failure only leaves the corresponding pages cold.
-    std::vector<std::pair<uint64_t, uint64_t>> expert_ranges;
-    for (const LayerExperts & L : layers_) {
-        if (!L.bound) continue;
-        for (int p = 0; p < MoeRecipe::max_exps; ++p) {
-            const uint64_t sz = (uint64_t) L.proj[p].nb2 * (uint64_t) n_expert_;
-            if (sz) expert_ranges.push_back({L.proj[p].file_off, L.proj[p].file_off + sz});
-        }
-    }
-    std::sort(expert_ranges.begin(), expert_ranges.end());
-
-    pio::fd_t fd = pio::open_read(gguf_path.c_str(), false);
-    if (!pio::fd_ok(fd)) return;
-    const size_t chunk = 8ull << 20;
-    void * buf = pio::alloc_aligned(align_, chunk);
-    if (!buf) {
-        pio::close_fd(fd);
-        return;
-    }
-
-    const auto t0 = clock_t_::now();
-    uint64_t warmed = 0;
-    bool ok = true;
-    auto sweep = [&](uint64_t beg, uint64_t end) {
-        for (uint64_t a = beg; a < end && ok;) {
-            const long long got = pio::pread_at(fd, buf, (size_t) std::min<uint64_t>(chunk, end - a), a);
-            if (got <= 0) {
-                ok = false; // best-effort: those pages just stay cold
-                break;
-            }
-            a += (uint64_t) got;
-            warmed += (uint64_t) got;
-        }
-    };
-    uint64_t pos = 0;
-    for (const auto & r : expert_ranges) {
-        if (r.first > pos) sweep(pos, r.first); // gap before this expert range is dense
-        pos = std::max(pos, r.second);
-    }
-    if (pos < fsize_) sweep(pos, fsize_); // trailing dense tail (lm_head et al.)
-
-    pio::aligned_free(buf);
-    pio::close_fd(fd);
-    const double s = std::chrono::duration<double>(clock_t_::now() - t0).count();
-    std::fprintf(stderr, "bmoe: dense warm-up — %llu MiB in %.1f s%s\n", (unsigned long long) (warmed >> 20), s,
-                 ok ? "" : " (partial)");
-}
-
-// ── --dense-odirect: read each dense tensor whole into an anon buffer and rebind onto it ──
-bool ExpertStreamSource::read_dense_odirect() {
-    // Chunked so read_slice's per-lane bounce stays bounded (a dense tensor can be hundreds of MiB);
-    // each chunk re-reads at most one partial page at its boundary, which is harmless. Lane 0 only —
-    // this runs before the workers start, so there is no contention on the bounce or fd.
-    const uint64_t chunk = 8ull << 20;
-    uint64_t total = 0;
-    dense_bufs_.reserve(dense_tensors_.size());
-    dense_buf_sz_.reserve(dense_tensors_.size());
-    for (const DenseTensorRef & d : dense_tensors_) {
-        if (!d.tensor || d.size == 0) continue;
-        void * buf = pio::alloc_aligned(align_, (size_t) d.size);
-        if (!buf) {
-            std::fprintf(stderr, "bmoe: dense buffer alloc %llu failed\n", (unsigned long long) d.size);
-            return false;
-        }
-        dense_bufs_.push_back(buf); // tracked for shutdown even if a chunk read below fails
-        dense_buf_sz_.push_back((size_t) d.size); // paired size, for the anon-residency sample
-        for (uint64_t done = 0; done < d.size;) {
-            IoJob j;
-            j.dst = (char *) buf + done;
-            j.off = d.file_off + done;
-            j.nbytes = std::min<uint64_t>(chunk, d.size - done);
-            if (!read_slice(0, j)) return false;
-            done += j.nbytes;
-        }
-        d.tensor->data = buf; // rebind the model weight onto its private anon copy
-        total += d.size;
-    }
-    std::fprintf(stderr, "bmoe: --dense-odirect — %llu MiB of dense weights in %zu anon buffers\n",
-                 (unsigned long long) (total >> 20), dense_bufs_.size());
-
-    // Hand the mmap copies back. The capture warm-up decode faulted these dense pages in mmap-
-    // resident, and we have just read them again into anon buffers and rebound every tensor onto
-    // those — so the file-backed pages are now referenced by nobody. Left alone they sit resident
-    // until reclaim, doubling the dense footprint at the worst moment (right before prefill, when the
-    // governor's entry test reads MemAvailable). Drop them explicitly instead: a clean read-only
-    // mapping, so MADV_DONTNEED loses no data and nothing will refault the range. Best-effort — it
-    // needs /proc/self/maps to turn a file offset into an address; where that is unreadable (or the
-    // host build) the pages simply stay, which only forfeits the saving.
-    std::vector<pio::MappedRegion> vmas;
-    const size_t slash = gguf_path_.find_last_of("/\\");
-    const std::string base = slash == std::string::npos ? gguf_path_ : gguf_path_.substr(slash + 1);
-    if (pio::file_mapped_regions(base.c_str(), vmas) && !vmas.empty()) {
-        const size_t pg = pio::vm_page();
-        auto addr_of = [&](uint64_t off) -> char * {
-            for (const auto & v : vmas) {
-                const uint64_t span = (uint64_t) (v.end - v.start);
-                if (off >= v.file_offset && off < v.file_offset + span) return (char *) v.start + (off - v.file_offset);
-            }
-            return nullptr;
-        };
-        uint64_t dropped = 0;
-        for (const DenseTensorRef & d : dense_tensors_) {
-            if (!d.tensor || d.size == 0) continue;
-            char * a = addr_of(d.file_off);
-            if (!a) continue;
-            // Align INWARD to whole pages (round the start up, the end down), so a page shared with an
-            // adjacent tensor that stays mmap-resident — an expert slice, or the next dense tensor — is
-            // never dropped out from under it. Same clipping the residency sampler applies.
-            uintptr_t a0 = ((uintptr_t) a + pg - 1) & ~(uintptr_t) (pg - 1);
-            uintptr_t a1 = ((uintptr_t) a + d.size) & ~(uintptr_t) (pg - 1);
-            if (a1 > a0) {
-                pio::vm_drop_file_pages((void *) a0, (size_t) (a1 - a0));
-                dropped += a1 - a0;
-            }
-        }
-        if (dropped)
-            std::fprintf(stderr, "bmoe: --dense-odirect — dropped %llu MiB of now-unused mmap pages\n",
-                         (unsigned long long) (dropped >> 20));
-    }
+                 (int) reader_.direct(), io_threads_, cache_max_ >> 20);
     return true;
 }
 
 // ── one aligned slice read on a lane ────────────────────────────────────────────────
+// The bytes come from the reader; this wraps it with the domain the reader must not know about — the
+// per-read I/O trace that attributes a read to its (layer, expert, projection). Latency is timed here
+// so the row carries this read's own cost, not the reader's running total.
 bool ExpertStreamSource::read_slice(int lane, const IoJob & j) {
-    void * const dst = j.dst;
-    const uint64_t off = j.off, nbytes = j.nbytes;
-    if (nbytes == 0) return true;
-    const uint64_t a0 = off & ~(uint64_t) (align_ - 1);
-    const uint64_t a1 = (off + nbytes + align_ - 1) & ~(uint64_t) (align_ - 1);
-    const size_t len = (size_t) (a1 - a0);
-    if (bounce_sz_[lane] < len) {
-        if (bounces_[lane]) pio::aligned_free(bounces_[lane]);
-        bounces_[lane] = pio::alloc_aligned(align_, len);
-        if (!bounces_[lane]) {
-            std::fprintf(stderr, "bmoe: bounce realloc %zu failed\n", len);
-            return false;
-        }
-        bounce_sz_[lane] = len;
-    }
-    char * b = (char *) bounces_[lane];
-    const pio::fd_t fd = fds_[lane];
-    const pio::fd_t fd_buf = fds_buf_[lane];
-    const uint64_t read_end = (fsize_ && a1 > fsize_) ? fsize_ : a1;
-    const uint64_t bulk_end = o_direct_ ? (read_end & ~(uint64_t) (align_ - 1)) : read_end;
-
+    if (j.nbytes == 0) return true;
     const auto t0 = clock_t_::now();
-    for (uint64_t a = a0; a < bulk_end;) {
-        long long got = pio::pread_at(fd, b + (a - a0), (size_t) (bulk_end - a), a);
-        if (got <= 0) {
-            std::fprintf(stderr, "bmoe: pread failed at %llu\n", (unsigned long long) a);
-            return false;
-        }
-        a += (uint64_t) got;
-    }
-    for (uint64_t a = bulk_end; a < read_end;) { // sub-alignment EOF tail via the buffered fd
-        long long got = pio::pread_at(pio::fd_ok(fd_buf) ? fd_buf : fd, b + (a - a0), (size_t) (read_end - a), a);
-        if (got <= 0) {
-            std::fprintf(stderr, "bmoe: tail pread failed at %llu\n", (unsigned long long) a);
-            return false;
-        }
-        a += (uint64_t) got;
-    }
-    const auto t1 = clock_t_::now();
-    const uint64_t lat_ns = (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
-    io_syscall_ns_.fetch_add((long long) lat_ns);
-    std::memcpy(dst, b + (off - a0), (size_t) nbytes);
-    read_bytes_.fetch_add((long long) (read_end - a0));
+    const long long window = reader_.read(lane, j.dst, j.off, j.nbytes);
+    if (window < 0) return false;
 
-    // The trace records the read as issued, not as accounted: `read_bytes` is the aligned window
-    // actually pulled, which is what the drive was asked for and what the effective bandwidth must
-    // be judged against — `req_bytes` is only what the caller wanted out of it.
     if (io_trace_on_) {
+        const uint64_t lat_ns =
+            (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t_::now() - t0).count();
         IoTraceRow r;
         r.layer = j.layer;
         r.expert = j.expert;
         r.proj = (int8_t) j.proj;
         r.lane = (int8_t) lane;
         r.spec = j.spec;
-        r.offset = off;
-        r.req_bytes = nbytes;
-        r.read_bytes = read_end - a0;
+        r.offset = j.off;
+        r.req_bytes = j.nbytes;
+        r.read_bytes = (uint64_t) window; // the aligned window pulled — what bandwidth is judged against
         r.latency_ns = lat_ns;
         std::lock_guard<std::mutex> lk(io_trace_mtx_);
         io_trace_rows_.push_back(r);
@@ -713,95 +471,6 @@ void ExpertStreamSource::sample_residency() {
     resident_frac_ = sampled ? (double) resident / (double) sampled : -1.0;
 }
 
-// The dense weights' residency, the half resident_frac cannot see. The weights are one mmap of the
-// gguf; a dense file offset becomes an address through the VMA that backs it (/proc/self/maps),
-// which — unlike /proc/vmstat — an app may read, being its own. Probe dense_sample_pages points
-// spread evenly across the dense byte ranges; one page each, so the cost is a few hundred mincore
-// calls, and only every residency_probe_every load. Shares probe_tick_ with sample_residency, so it
-// fires on the same throttle without a second counter.
-void ExpertStreamSource::sample_dense_residency() {
-    // Under --dense-odirect the dense weights are our own anon buffers, not the mmap the block below
-    // samples. But anon memory is reclaimed too (to zram), and mincore reports resident anon pages
-    // exactly as it does file pages — so sample the buffers directly and dense_resident_frac keeps its
-    // meaning ("how much of the dense set the kernel still has in RAM") instead of reading unmeasured.
-    if (dense_odirect_) {
-        if (dense_bufs_.empty()) return;
-        // Share sample_residency's throttle: it has just done the ++ this load, so fire on the same
-        // loads and skip the rest, without a second counter.
-        if (probe_tick_ % residency_probe_every != 0) return;
-        uint64_t total = 0;
-        for (size_t sz : dense_buf_sz_)
-            total += sz;
-        if (total == 0) return;
-        size_t sampled = 0, resident = 0;
-        for (int k = 0; k < dense_sample_pages; ++k) {
-            // Stratified: the k-th of dense_sample_pages evenly spaced points across the summed buffer
-            // bytes, one page each — the same shape as the mmap path, so the two modes are comparable.
-            uint64_t target = (total * (uint64_t) k) / (uint64_t) dense_sample_pages;
-            for (size_t i = 0; i < dense_bufs_.size(); ++i) {
-                if (target < dense_buf_sz_[i]) {
-                    const char * a = (const char *) dense_bufs_[i] + target;
-                    const char * pg = (const char *) ((uintptr_t) a & ~(uintptr_t) (page_ - 1));
-                    pio::vm_resident_sample(pg, page_, &sampled, &resident);
-                    break;
-                }
-                target -= dense_buf_sz_[i];
-            }
-        }
-        dense_resident_frac_ = sampled ? (double) resident / (double) sampled : -1.0;
-        return;
-    }
-    if (dense_ranges_.empty()) return;
-    // Share sample_residency's throttle without a second counter: it has just done the ++, so this
-    // fires exactly on the loads where it did, and skips the rest.
-    if (probe_tick_ % residency_probe_every != 0) return;
-    if (!dense_vmas_tried_) { // resolve the mmap once; llama.cpp has mapped the file by first decode
-        dense_vmas_tried_ = true;
-        const size_t slash = gguf_path_.find_last_of("/\\");
-        const std::string base = slash == std::string::npos ? gguf_path_ : gguf_path_.substr(slash + 1);
-        pio::file_mapped_regions(base.c_str(), dense_vmas_);
-    }
-    if (dense_vmas_.empty()) return; // maps unreadable → leave dense_resident_frac_ at -1
-
-    uint64_t total = 0;
-    for (const auto & r : dense_ranges_)
-        total += r.second - r.first;
-    if (total == 0) return;
-
-    // Map a file offset to a virtual address via the VMA that contains it. A large mmap can be split
-    // into several VMAs, so search rather than assume one.
-    auto addr_of = [&](uint64_t off) -> const char * {
-        for (const auto & v : dense_vmas_) {
-            const uint64_t span = (uint64_t) (v.end - v.start);
-            if (off >= v.file_offset && off < v.file_offset + span)
-                return (const char *) v.start + (off - v.file_offset);
-        }
-        return nullptr;
-    };
-
-    size_t sampled = 0, resident = 0;
-    for (int k = 0; k < dense_sample_pages; ++k) {
-        // Stratified: the k-th of dense_sample_pages evenly spaced points across the dense bytes.
-        uint64_t target = (total * (uint64_t) k) / (uint64_t) dense_sample_pages;
-        uint64_t off = 0;
-        for (const auto & r : dense_ranges_) {
-            const uint64_t len = r.second - r.first;
-            if (target < len) {
-                off = r.first + target;
-                break;
-            }
-            target -= len;
-        }
-        // Align the probe DOWN to its page: vm_resident_sample counts only pages fully inside the
-        // range, so a single page's worth handed in at an arbitrary offset would clip to nothing.
-        if (const char * a = addr_of(off)) {
-            const char * pg = (const char *) ((uintptr_t) a & ~(uintptr_t) (page_ - 1));
-            pio::vm_resident_sample(pg, page_, &sampled, &resident);
-        }
-    }
-    dense_resident_frac_ = sampled ? (double) resident / (double) sampled : -1.0;
-}
-
 // A token's pass over the layer stack is monotonic in il, so a non-increasing layer index means the
 // previous token's pass just ended and the bytes it demanded are known. Prefill measures the
 // batch's union (larger); the first decode token overwrites it with the decode value, which is the
@@ -954,8 +623,8 @@ bool ExpertStreamSource::load_layer(int il, const int32_t * ids, int n_ids) {
         // loop, where an evicting shrink is safe) and we only sense here; otherwise the legacy
         // free-RAM tracking sizes it in place.
         if (cache_dynamic_) {
-            sample_residency();
-            sample_dense_residency();
+            sample_residency(); // increments probe_tick_ and samples the cache on the throttle tick
+            if (probe_tick_ % residency_probe_every == 0) dense_.sample_residency(page_); // the same tick
         } else {
             adapt_cache_budget(); // re-size to free RAM before this layer stages + evicts
         }
@@ -1105,8 +774,8 @@ bool ExpertStreamSource::load_layer_async(int il, const int32_t * ids, int n_ids
         quiesce_spec();
         // See the serial path: the governor owns the budget when it is on, and only senses here.
         if (cache_dynamic_) {
-            sample_residency();
-            sample_dense_residency();
+            sample_residency(); // increments probe_tick_ and samples the cache on the throttle tick
+            if (probe_tick_ % residency_probe_every == 0) dense_.sample_residency(page_); // the same tick
         } else {
             adapt_cache_budget(); // re-size to free RAM before this layer stages + evicts
         }
@@ -1298,11 +967,11 @@ void ExpertStreamSource::enable_overlap_hook() {
 
 IExpertSource::Stats ExpertStreamSource::stats() const {
     Stats s;
-    s.read_bytes = (uint64_t) read_bytes_.load();
+    s.read_bytes = (uint64_t) reader_.read_bytes();
     // Serial: read_ns_ is the wall time the caller was blocked in the read phase. Overlap: the
-    // caller never blocks, so "I/O time" is instead the summed lane-busy time (io_syscall_ns_),
-    // which the runtime reports as lane-busy per token rather than as a slice of wall time.
-    s.read_seconds = (overlap_ ? io_syscall_ns_.load() : read_ns_.load()) / 1e9;
+    // caller never blocks, so "I/O time" is instead the summed lane-busy time (the reader's syscall
+    // ns), which the runtime reports as lane-busy per token rather than as a slice of wall time.
+    s.read_seconds = (overlap_ ? reader_.syscall_ns() : read_ns_.load()) / 1e9;
     s.mgmt_seconds = mgmt_ns_.load() / 1e9;
     s.spec_read_bytes = (uint64_t) spec_read_bytes_.load();
     s.spec_experts = spec_experts_.load();
@@ -1314,7 +983,7 @@ IExpertSource::Stats ExpertStreamSource::stats() const {
     s.cache_budget_bytes = (uint64_t) cache_max_;
     s.cache_resizes = cache_resizes_;
     s.cache_resident_frac = resident_frac_;
-    s.dense_resident_frac = dense_resident_frac_;
+    s.dense_resident_frac = dense_.resident_frac();
     s.token_demand_bytes = (uint64_t) token_demand_;
     s.layer_demand_bytes = (uint64_t) layer_demand_;
     return s;
@@ -1362,24 +1031,12 @@ void ExpertStreamSource::shutdown() {
         lbuf_[p].clear();
         lbuf_sz_[p].clear();
     }
-    for (void * b : bounces_)
-        if (b) pio::aligned_free(b);
-    bounces_.clear();
-    bounce_sz_.clear();
-    // --dense-odirect anon buffers. Safe here: the context (whose rebound dense tensors point at
-    // these) is torn down after the source, and no decode is in flight — same contract as the slot
-    // and LRU buffers freed above.
-    for (void * b : dense_bufs_)
-        if (b) pio::aligned_free(b);
-    dense_bufs_.clear();
-    dense_buf_sz_.clear();
+    // The dense-weights module frees its own anon buffers here. Safe: the context (whose rebound
+    // dense tensors point at them) is torn down after the source, and no decode is in flight — same
+    // contract as the slot and LRU buffers freed above.
+    dense_.shutdown();
     dense_tensors_.clear();
-    for (int lane = 0; lane < (int) fds_.size(); ++lane) {
-        if (pio::fd_ok(fds_[lane])) pio::close_fd(fds_[lane]);
-        if (pio::fd_ok(fds_buf_[lane])) pio::close_fd(fds_buf_[lane]);
-    }
-    fds_.clear();
-    fds_buf_.clear();
+    reader_.close(); // closes the lane fds and frees the bounces
     jobs_.clear();
     layers_.clear();
     active_ = false;
