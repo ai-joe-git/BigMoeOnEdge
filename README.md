@@ -14,6 +14,12 @@ about five times more model than memory, so holding it resident is simply imposs
 anyway, at **1.3 tok/s** with the model's own settings (**2.2 tok/s** with one speed knob), against
 **0.09 tok/s** for the same file loaded the ordinary way (mmap).
 
+| gpt-oss-120b — ~60 GB, ~5× RAM | Qwen3-30B-A3B — 18.5 GB | Gemma-4-26B-A4B — 17.0 GB |
+|:---:|:---:|:---:|
+| https://github.com/user-attachments/assets/9e3701c8-e646-4248-9698-4fb8055fa658 | https://github.com/user-attachments/assets/4955559f-7a8a-43a5-8d12-85fae242b4d4 | https://github.com/user-attachments/assets/b7d50f27-5275-4163-9e34-35196163ac30 |
+
+<p align="center"><em>Recorded in the demo app on the OnePlus 15R — real time, not sped up.</em></p>
+
 **And it's all plain CPU inference.** No GPU, no NPU, no special hardware: four CPU cores, the
 phone's flash storage, and nothing else. The entire budget is a phone's UFS storage, a fraction of
 the bandwidth a desktop NVMe drive offers, which is exactly why the expert cache, the dense-weight
@@ -31,7 +37,7 @@ Highlights:
 
 - **gpt-oss-120b (Q4_K_M), ~5× device RAM**: **1.3 tok/s** at the model's own routing width against
   0.09 tok/s for the same file loaded the ordinary way (mmap), a **14×** difference at matched settings.
-  **2.2 tok/s** with the one lossy knob on (less experts)
+  **2.2 tok/s** with the one lossy knob on (fewer experts).
 - **Lossless on models past RAM**: Qwen3-30B-A3B (Q4_K_M, 18.5 GB) up to **5.2 tok/s** and
   Gemma-4-26B-A4B (Q4_K_M, 17.0 GB) up to **4.1 tok/s** on the same phone, output identical to the
   resident model.
