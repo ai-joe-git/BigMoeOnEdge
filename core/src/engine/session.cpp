@@ -1,4 +1,5 @@
 #include "bmoe/session.h"
+#include "bmoe/cache_governor.h"
 #include "bmoe/recipe.h"
 #include "bmoe/route_trace.h"
 #include "bmoe/decode_trace.h"
@@ -103,9 +104,13 @@ struct Session::Impl {
     std::vector<llama_token> kv_tokens;
 
     // Route trace (diagnostics): null unless requested AND streaming is on — there is no routing
-    // to trace otherwise. trace_turn labels each generate()'s rows in a multi-turn session.
+    // to trace otherwise.
     IRouteTraceSink * route_trace = nullptr;
-    int trace_turn = 0;
+
+    // Which generate() this is, 0-based. It labels a trace's rows, and it labels every token's
+    // metrics — a multi-turn CSV is unreadable without it, and the two-turn A/B (a fast turn, an
+    // idle, then the turn that pays for it) is exactly what this engine is measured by.
+    int turn = 0;
 
     // Decode traces (diagnostics): null unless requested. The compute trace needs no streaming —
     // it measures the graph, which a dense mmap run has too; the I/O trace needs the streamer,
@@ -113,6 +118,19 @@ struct Session::Impl {
     IComputeTraceSink * compute_trace = nullptr;
     IIoTraceSink * io_trace = nullptr;
     std::vector<IoTraceRow> io_rows_scratch;
+
+    // Pressure-aware cache sizing (--cache-dynamic): null unless requested AND the LRU cache is on.
+    // It lives here, not in the streamer, because it ticks once per token from the generation loop —
+    // the only point where no decode is in flight and an evicting shrink is safe. It outlives a
+    // single generate() on purpose: reclaim is a property of the session's residency, and what the
+    // last turn learned about this device is exactly what the next turn needs.
+    std::unique_ptr<CacheGovernor> gov;
+
+    // Stated once to a metrics sink, before the first token: the model and configuration every row
+    // it writes was produced under. info_sent guards a session's many generate() calls from
+    // interleaving preambles between turns.
+    RunInfo info;
+    bool info_sent = false;
 
     std::atomic<bool> cancel_requested{false};
 
@@ -310,6 +328,23 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
             return fail("expert stream source init failed");
         im.hook->set_source(&im.source);
 
+        // The budget the streamer settled on — an explicit cache_mb, or what auto sized to — is the
+        // most the user sanctioned, so it becomes the governor's ceiling and its starting point. The
+        // loop only ever asks for less than this, and climbs back toward it when the device allows.
+        const uint64_t configured = im.source.stats().cache_budget_bytes;
+        if (cfg.moe.cache_dynamic && configured > 0) {
+            CacheGovernorParams gp;
+            gp.user_cap = (size_t) configured;
+            gp.initial = (size_t) configured;
+            // Holds only until the streamer has staged a layer and can report the real mechanical
+            // floor. It must stay small: cache_min_mb would put a 1500 MiB floor here, which on a
+            // model the device concedes less to is just the pinned-inside-a-war failure wearing a
+            // rounder number. Being briefly too small costs hits for a few tokens; being too big
+            // costs the war this loop exists to end.
+            gp.min_cap = std::min<size_t>(64ull * 1024 * 1024, (size_t) configured);
+            im.gov = std::make_unique<CacheGovernor>(gp);
+        }
+
         if (route_trace) {
             im.route_trace = route_trace;
             im.hook->set_trace(true);
@@ -368,6 +403,45 @@ std::unique_ptr<Session> Session::open(const SessionConfig & cfg,
         if (im.io_trace) im.io_trace->on_static(st);
     }
 
+    // What this session IS, for any metrics sink that will describe what it DOES. Built here, where
+    // every fact is resolved: cache_mb in particular is what the streamer settled on, which under
+    // auto-sizing is a number no flag ever mentioned.
+    {
+        RunInfo & ri = im.info;
+        const std::string & p = cfg.model_path;
+        const size_t slash = p.find_last_of("/\\");
+        ri.model = slash == std::string::npos ? p : p.substr(slash + 1);
+        ri.arch = im.arch;
+        ri.n_layer = im.n_layer;
+        ri.n_threads = cfg.n_threads;
+        ri.n_ctx = cfg.n_ctx;
+        ri.moe_stream = cfg.moe.enabled;
+        ri.cache_auto = cfg.moe.cache_auto;
+        ri.cache_ceil_mb = cfg.moe.cache_ceil_mb;
+        ri.cache_dynamic = cfg.moe.cache_dynamic;
+        ri.force_cache = cfg.moe.force_cache;
+        ri.io_threads = cfg.moe.enabled ? cfg.moe.io_threads : 0;
+        ri.o_direct = cfg.moe.enabled && cfg.moe.o_direct;
+        ri.overlap = cfg.moe.enabled && cfg.moe.overlap;
+        ri.prefetch_layers = cfg.moe.enabled ? cfg.moe.prefetch_layers : 0;
+        ri.warm_dense = cfg.moe.enabled && cfg.moe.warm_dense;
+        if (cfg.moe.enabled) {
+            const IExpertSource::Stats st = im.source.stats();
+            ri.cache_mb = (int) (st.cache_budget_bytes / (1024ull * 1024ull));
+        }
+        // The EFFECTIVE top-k: an override IS the applied width, otherwise the model's own. Same
+        // resolution the route trace does, and worth a header read — a run whose top-k is unknown
+        // cannot be compared against one whose top-k differs, which is most of the point.
+        ri.n_expert_used = cfg.n_expert_used;
+        if (ri.n_expert_used <= 0 || ri.n_expert == 0) {
+            const GgufModelInfo mi = read_gguf_model_info(cfg.model_path.c_str());
+            if (mi.ok) {
+                ri.n_expert = mi.n_expert;
+                if (ri.n_expert_used <= 0) ri.n_expert_used = mi.n_expert_used;
+            }
+        }
+    }
+
     im.load_seconds = secs(t_load0, clock_t_::now());
     return self;
 }
@@ -378,6 +452,12 @@ RunResult Session::generate(const GenerateRequest & req,
     Impl & im = *impl_;
     const MoeStreamConfig & moe = im.cfg.moe;
     llama_context * ctx = im.ctx.get();
+
+    // Before anything is written about what this run did, say what it was.
+    if (sink && !im.info_sent) {
+        sink->on_run_info(im.info);
+        im.info_sent = true;
+    }
 
     // Fresh cancel latch for this generation; a stale request from a prior aborted call must
     // not carry over. (cancel() sets it; the abort callback reads it.)
@@ -522,10 +602,10 @@ RunResult Session::generate(const GenerateRequest & req,
     // The frame the I/O rows are stamped with at flush; the other traces carry their own.
     int trace_phase = 0, trace_step = 0;
     auto trace_begin = [&](int base_pos, int n_tokens, int phase) {
-        if (im.route_trace) im.hook->begin_trace_batch(base_pos, n_tokens, phase, im.trace_turn);
+        if (im.route_trace) im.hook->begin_trace_batch(base_pos, n_tokens, phase, im.turn);
         // A node is computed once for the whole batch, not per token, so a prefill chunk's graph is
         // attributed to its last position rather than pretending to split across the chunk.
-        if (im.compute_trace) im.hook->begin_compute_batch(base_pos + n_tokens - 1, phase, im.trace_turn);
+        if (im.compute_trace) im.hook->begin_compute_batch(base_pos + n_tokens - 1, phase, im.turn);
         trace_phase = phase;
         trace_step = base_pos + n_tokens - 1;
     };
@@ -546,7 +626,7 @@ RunResult Session::generate(const GenerateRequest & req,
             // so stamp them with the decode they were drained after.
             im.source.take_io_trace_rows(im.io_rows_scratch);
             for (IoTraceRow & r : im.io_rows_scratch) {
-                r.turn = im.trace_turn;
+                r.turn = im.turn;
                 r.phase = trace_phase;
                 r.step = trace_step;
             }
@@ -651,10 +731,32 @@ RunResult Session::generate(const GenerateRequest & req,
         // mmap baseline too — so record it for every token before the moe/no-moe split below.
         m.majflt = f1 - f0;
         m.cpu_ms = (c1 - c0) * 1000.0;
+        m.majflt_mib = (double) m.majflt * (double) pio::fault_bytes() / (1024.0 * 1024.0);
+        m.turn = im.turn;
         gen_majflt += m.majflt;
         gen_cpu_seconds += (c1 - c0);
+
+        // Read the memory picture AFTER the decode, outside the s0..s1 bracket: two /proc reads are
+        // cheap but they are not this token's work, and billing them to wall_ms would corrupt the
+        // very number the reader is here to trust.
+        pio::ProcessMemory pm;
+        if (pio::process_memory(&pm)) {
+            m.rss_mib = pm.rss_bytes / (1024.0 * 1024.0);
+            m.rss_anon_mib = pm.rss_anon_bytes / (1024.0 * 1024.0);
+            m.rss_file_mib = pm.rss_file_bytes / (1024.0 * 1024.0);
+            m.swap_mib = pm.swap_bytes / (1024.0 * 1024.0);
+        }
+        pio::DeviceMemory dm;
+        if (pio::device_memory(&dm)) {
+            m.mem_available_mib = dm.available_bytes / (1024.0 * 1024.0);
+            m.mem_free_mib = dm.free_bytes / (1024.0 * 1024.0);
+            m.swap_free_mib = dm.swap_free_bytes / (1024.0 * 1024.0);
+        }
         if (moe.enabled) {
             IExpertSource::Stats st = im.source.stats();
+            m.resident_frac = st.cache_resident_frac;
+            m.dense_resident_frac = st.dense_resident_frac;
+            m.cache_budget_mib = st.cache_budget_bytes / (1024.0 * 1024.0);
             m.read_bytes = (uint64_t) ((long long) st.read_bytes - prev_bytes);
             m.io_ms = (st.read_seconds - prev_io_s) * 1000.0;
             m.mgmt_ms = (st.mgmt_seconds - prev_mgmt_s) * 1000.0;
@@ -674,6 +776,18 @@ RunResult Session::generate(const GenerateRequest & req,
             gen_io_seconds += m.io_ms / 1000.0;
             gen_mgmt_seconds += m.mgmt_ms / 1000.0;
             gen_stall_seconds += m.stall_ms / 1000.0;
+
+            // Size the cache to what the device concedes, here and nowhere else: between two decodes
+            // nothing is staged for a generation in flight, which is exactly the precondition
+            // set_cache_budget needs to evict the cold tail without a cstamp guard.
+            if (im.gov) {
+                CacheSignals sig;
+                sig.majflt = m.majflt;
+                sig.resident_frac = st.cache_resident_frac;
+                sig.floor = (size_t) st.layer_demand_bytes;
+                const CacheGovernor::Decision d = im.gov->on_token(sig);
+                if (d.changed) im.source.set_cache_budget(d.cap);
+            }
         } else {
             m.compute_ms = m.wall_ms;
             m.cache_hit_pct = -1.0;
@@ -682,7 +796,7 @@ RunResult Session::generate(const GenerateRequest & req,
         if (sink) sink->on_token(m);
     }
 
-    if (im.route_trace) ++im.trace_turn; // this turn's rows are written; label the next one apart
+    ++im.turn; // this turn is written; label the next one apart
 
     // ── summary ──
     RunSummary & s = res.summary;
@@ -710,6 +824,9 @@ RunResult Session::generate(const GenerateRequest & req,
         s.cache_resident_mib = st.cache_resident_bytes / (1024.0 * 1024.0);
         s.cache_budget_mib = st.cache_budget_bytes / (1024.0 * 1024.0);
         s.cache_resizes = st.cache_resizes;
+        s.token_demand_mib = st.token_demand_bytes / (1024.0 * 1024.0);
+        s.layer_demand_mib = st.layer_demand_bytes / (1024.0 * 1024.0);
+        s.cache_cuts = im.gov ? im.gov->cuts() : 0;
         s.moe_spec_read_mib = ((long long) st.spec_read_bytes - prev_spec_bytes) / (1024.0 * 1024.0);
         s.moe_spec_experts = st.spec_experts - prev_spec_experts;
         s.moe_spec_useful = st.spec_useful - prev_spec_useful;

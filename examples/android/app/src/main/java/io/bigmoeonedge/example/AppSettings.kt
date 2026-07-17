@@ -13,6 +13,9 @@ data class AppSettings(
     val mmap: Boolean = false,          // baseline: no streaming — llama.cpp mmap loads the whole model
     val cacheMb: Int = CACHE_AUTO,      // LRU expert cache budget; Auto / 0 / 500..6000 (see CACHE_CHOICES)
     val cacheCeilMb: Int = 3000,        // with cacheMb=Auto: upper bound on the auto budget (0 = no cap)
+    val cacheDynamic: Boolean = false,  // treat the budget as a ceiling and let the engine find the
+                                        // largest cache the device concedes (--cache-dynamic). Off
+                                        // until it is measured on device, like every other claim here.
     val ioThreads: Int = 4,             // parallel expert-read lanes
     val threads: Int = 4,               // compute threads (-t)
     val nExpertUsed: Int = 0,           // top-k override (0 = model default); lower = faster, changes output
@@ -22,6 +25,7 @@ data class AppSettings(
     val warmDense: Boolean = true,      // page-cache the non-expert weights at load (kills >RAM slow-start)
     val prefetchLayers: Int = 0,        // temporal prefetch depth K (0 = off); needs the cache
     val thinking: Boolean = false,      // reasoning; off passes --no-think (enable_thinking=false)
+    val metricsCsv: Boolean = true,     // write the engine's per-token CSV for this session (--csv)
 ) {
     /**
      * Build the argv that OPENS a persistent bmoe-cli session (`--session`): everything fixed for
@@ -32,8 +36,13 @@ data class AppSettings(
      * When [mmap] is set, expert streaming is turned off entirely: the CLI omits --moe-stream and
      * every streaming knob (cache / lanes / O_DIRECT / overlap), so llama.cpp loads the whole model
      * via mmap through the page cache — the baseline the streaming modes compare to.
+     *
+     * @param csvPath where the engine should write its per-token metrics CSV, or null to not ask
+     *   for one. One file per SESSION, not per turn: the engine appends every turn's rows to it and
+     *   marks each with a `turn` column, which is the only way to read the two-turn shape this
+     *   engine is judged by (a fast turn, an idle, then the turn that pays for it).
      */
-    fun sessionArgv(cliPath: String, modelPath: String): List<String> {
+    fun sessionArgv(cliPath: String, modelPath: String, csvPath: String? = null): List<String> {
         val a = mutableListOf(
             cliPath,
             "-m", modelPath,
@@ -45,6 +54,9 @@ data class AppSettings(
         // Active-expert (top-k) override is a load-time kv_override, valid with or without
         // streaming — so it lives outside the mmap gate below.
         if (nExpertUsed > 0) a += listOf("--n-expert-used", nExpertUsed.toString())
+        // Outside the mmap gate too: the fault and memory columns are measured whether or not the
+        // streamer is on, and the mmap baseline is exactly what they are compared against.
+        if (metricsCsv && csvPath != null) a += listOf("--csv", csvPath)
         if (!mmap) {
             a += "--moe-stream"
             if (cacheMb == CACHE_AUTO) {
@@ -64,6 +76,8 @@ data class AppSettings(
             // Auto sizing is a live LRU cache, so it satisfies the prefetch cache requirement.
             val cacheOn = cacheMb == CACHE_AUTO || cacheMb > 0
             if (prefetchLayers > 0 && cacheOn) a += listOf("--prefetch", prefetchLayers.toString())
+            // Same requirement: there is no budget to size at runtime with the cache off.
+            if (cacheDynamic && cacheOn) a += "--cache-dynamic"
         }
         return a
     }
@@ -75,20 +89,22 @@ data class AppSettings(
      * excluded — they vary per request without touching the loaded model.
      */
     fun sessionSignature(modelPath: String): String =
-        listOf(modelPath, mmap, cacheMb, cacheCeilMb, ioThreads, threads, nExpertUsed, oDirect, overlap,
-               warmDense, prefetchLayers)
+        listOf(modelPath, mmap, cacheMb, cacheCeilMb, cacheDynamic, ioThreads, threads, nExpertUsed, oDirect,
+               overlap, warmDense, prefetchLayers)
             .joinToString("|")
 
     fun save(ctx: Context) {
         ctx.prefs().edit()
             .putBoolean("mmap", mmap)
             .putInt("cacheMb", cacheMb).putInt("cacheCeilMb", cacheCeilMb)
+            .putBoolean("cacheDynamic", cacheDynamic)
             .putInt("ioThreads", ioThreads).putInt("threads", threads)
             .putInt("nExpertUsed", nExpertUsed)
             .putInt("nPredict", nPredict).putBoolean("oDirect", oDirect)
             .putBoolean("overlap", overlap).putBoolean("warmDense", warmDense)
             .putInt("prefetchLayers", prefetchLayers)
             .putBoolean("thinking", thinking)
+            .putBoolean("metricsCsv", metricsCsv)
             .apply()
     }
 
@@ -97,6 +113,30 @@ data class AppSettings(
         // long prompt plus the largest practical generation. A request that would overflow it is
         // rejected recoverably by the CLI, leaving the session usable.
         const val SESSION_CTX = 4096
+
+        /**
+         * A fresh CSV path for a session about to open, under the app's own external files dir —
+         * no permission needed to write, and `adb pull`-able without root:
+         *
+         *     /sdcard/Android/data/<pkg>/files/metrics/bmoe-<yyyyMMdd-HHmmss>.csv
+         *
+         * Timestamped rather than fixed, because a run you cannot tell apart from the previous one
+         * is not evidence. Returns null if the volume is unavailable, which just means no CSV.
+         */
+        fun newMetricsCsvPath(ctx: Context): String? {
+            val dir = java.io.File(ctx.getExternalFilesDir(null) ?: return null, "metrics")
+            if (!dir.isDirectory && !dir.mkdirs()) return null
+            val ts = java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US).format(java.util.Date())
+            return java.io.File(dir, "bmoe-$ts.csv").absolutePath
+        }
+
+        /** The most recent metrics CSV, or null if none was written yet. */
+        fun latestMetricsCsv(ctx: Context): java.io.File? {
+            val root = ctx.getExternalFilesDir(null) ?: return null
+            return java.io.File(root, "metrics")
+                .listFiles { f -> f.name.endsWith(".csv") }
+                ?.maxByOrNull { it.lastModified() }
+        }
 
         // -1 (Auto) sizes the cache to the device's free RAM at runtime (--cache-mb auto).
         //
@@ -131,6 +171,7 @@ data class AppSettings(
                 mmap = p.getBoolean("mmap", d.mmap),
                 cacheMb = p.getInt("cacheMb", d.cacheMb),
                 cacheCeilMb = p.getInt("cacheCeilMb", d.cacheCeilMb),
+                cacheDynamic = p.getBoolean("cacheDynamic", d.cacheDynamic),
                 ioThreads = p.getInt("ioThreads", d.ioThreads),
                 threads = p.getInt("threads", d.threads),
                 nExpertUsed = p.getInt("nExpertUsed", d.nExpertUsed),
@@ -140,6 +181,7 @@ data class AppSettings(
                 warmDense = p.getBoolean("warmDense", d.warmDense),
                 prefetchLayers = p.getInt("prefetchLayers", d.prefetchLayers),
                 thinking = p.getBoolean("thinking", d.thinking),
+                metricsCsv = p.getBoolean("metricsCsv", d.metricsCsv),
             )
         }
 

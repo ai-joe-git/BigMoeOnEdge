@@ -11,7 +11,8 @@ Emitted once per generated token, in order:
 BMOE_LOAD {"mb":<float>,"ms":<float>}
 BMOE_PROGRESS {"step":<int>,"steps":<int>,"wall_ms":<float>,"io_ms":<float>,
                "compute_ms":<float>,"mgmt_ms":<float>,"stall_ms":<float>,"read_mb":<float>,
-               "cache_hit_pct":<float>,"majflt":<int>,"cpu_ms":<float>,"text":"<string>"}
+               "cache_hit_pct":<float>,"majflt":<int>,"cpu_ms":<float>,"resident_frac":<float>,
+               "text":"<string>"}
 ```
 
 - `BMOE_LOAD` appears only when experts were read this token; `mb` is the flash bytes read,
@@ -53,6 +54,11 @@ BMOE_PROGRESS {"step":<int>,"steps":<int>,"wall_ms":<float>,"io_ms":<float>,
   near 100% is genuinely compute-bound, well below means the cores were throttled, preempted, or
   blocked (a low-clock frequency cap or a co-resident process), not doing more math. Both are `0`
   when the platform can't report them (the Windows host build); treat `0` as "unmeasured".
+- `resident_frac` is the sampled fraction of the expert cache's own pages the kernel still had in
+  RAM at the last probe. Below `1` the device is reclaiming the cache mid-run — the pressure
+  `--cache-dynamic` sizes against (see [pressure.md](pressure.md)). It is `-1` when unmeasured: the
+  sampler is throttled (it probes every ~2-3 tokens), streaming is off, or the platform cannot
+  report residency. Treat `-1` as "no sample", never as "nothing resident".
 - `text` is the full generated text so far, JSON-escaped (for streaming into a UI).
 
 ## End-of-run lines
@@ -98,19 +104,41 @@ prints just the summary lines.
 `--csv PATH` additionally writes one row per token:
 
 ```
-step,steps,wall_ms,io_ms,compute_ms,read_bytes,cache_hit_pct,stall_ms,mgmt_ms,majflt,cpu_ms
+step,steps,wall_ms,io_ms,compute_ms,read_bytes,cache_hit_pct,stall_ms,mgmt_ms,majflt,cpu_ms,resident_frac,
+dense_resident_frac,turn,majflt_mib,cache_budget_mib,rss_mib,rss_anon_mib,rss_file_mib,swap_mib,
+mem_available_mib,mem_free_mib,swap_free_mib
 ```
 
 followed by a `# summary ...` comment line. Intended for the benchmark sweep.
 
-`stall_ms`, `mgmt_ms`, `majflt` and `cpu_ms` are trailing columns appended (in that order) after
-the original seven. `stall_ms` is the wall time compute threads waited for expert reads that token
-(`0` in serial mode); `mgmt_ms` is the cache-management time described above; `majflt`/`cpu_ms` are
-the fault + CPU-time decomposition of the compute residual (see the `BMOE_PROGRESS` notes above),
-`0` when unmeasured. All are additive: older CSVs have fewer columns, so consumers must read by
+`stall_ms`, `mgmt_ms`, `majflt`, `cpu_ms` and `resident_frac` are trailing columns appended (in that
+order) after the original seven. `stall_ms` is the wall time compute threads waited for expert reads
+that token (`0` in serial mode); `mgmt_ms` is the cache-management time described above;
+`majflt`/`cpu_ms` are the fault + CPU-time decomposition of the compute residual (see the
+`BMOE_PROGRESS` notes above), `0` when unmeasured; `resident_frac` is the sampled cache residency,
+`-1` when unmeasured. All are additive: older CSVs have fewer columns, so consumers must read by
 column NAME (from the header row) and treat any as optional. The `# summary` line likewise gains
-`stall_s/tok=<s>`, `mgmt_s/tok=<s>`, `majflt/tok=<f>` and `cpu_s/tok=<s>` (see the `io_ms` note
-above for how the read-time columns are reinterpreted under overlap).
+`stall_s/tok=<s>`, `mgmt_s/tok=<s>`, `majflt/tok=<f>`, `cpu_s/tok=<s>`, `token_demand_MiB=<f>` (the
+expert bytes one token routes, measured — where cache hits start, NOT a floor to defend; see
+[pressure.md](pressure.md)), `layer_demand_MiB=<f>` (the widest layer's routed bytes: the mechanical
+floor the governor may not cut below) and `cache_cuts=<int>` (times `--cache-dynamic` shrank the budget under reclaim); see the
+`io_ms` note above for how the read-time columns are reinterpreted under overlap.
+
+The trailing block is the memory picture, added so a run can be diagnosed from its own file:
+
+| column | meaning |
+| --- | --- |
+| `turn` | which `generate()` this token belongs to (0 for a one-shot run). A session CSV spans every turn; without this the two-turn shape — a fast turn, an idle, then the turn that pays for it — is unreadable. |
+| `majflt_mib` | what those faults moved: `majflt` x page size. The same fact as the count, in the unit the rest of the row uses — directly comparable to `read_bytes`, i.e. the reads we chose against the reads the kernel forced on us. |
+| `cache_budget_mib` | the expert-cache budget this token ran under. Per token, not just in the summary: it is the governor's trajectory, and without it a loop that cut once and pinned reads exactly like one that never acted. |
+| `rss_anon_mib` | resident anonymous memory — **the expert cache lives here**. Falling while `cache_budget_mib` stays put means the kernel is taking the cache. |
+| `rss_file_mib` | resident file-backed memory — the mmap'd model. Reclaimed by being dropped, not swapped, so it never shows in `swap_mib`. |
+| `dense_resident_frac` | fraction of the DENSE mmap'd weights still in RAM, by `mincore` over the model's own VMAs (`/proc/self/maps`, which an app may read where `/proc/vmstat` it may not). Companion to `resident_frac`: that watches the anon cache, this the file-backed weights. Dense falling while `resident_frac` holds means the faults are the model, not the cache — so shrinking the cache cannot help. `-1` when unmeasured. |
+| `swap_mib` | anonymous memory already lost to zram (`VmSwap`). |
+| `rss_mib` | total resident (`VmRSS`). |
+| `mem_available_mib` / `mem_free_mib` / `swap_free_mib` | what the device claims about itself. `MemAvailable` counts this process's own mmap'd weights as reclaimable, so it over-states headroom — it is recorded next to what we measured ourselves because the gap between them is the story. |
+
+All are `0` where the platform cannot report them (the Windows host build reports device memory but not the per-process split).
 
 ## Route trace
 
@@ -221,7 +249,7 @@ BMOE_DONE  {"id":<int>,"cancelled":<bool>,"tokens":<int>,"tok_s":<float>,
             "n_prompt":<int>,"n_past":<int>,"compute_s_tok":<float>,"io_s_tok":<float>,
             "cache_resident_mib":<float>,"cache_budget_mib":<float>,"read_mib":<float>,
             "stall_s_tok":<float>,"mgmt_s_tok":<float>,"majflt_tok":<float>,"cpu_s_tok":<float>,
-            "text":"<string>"}
+            "token_demand_mib":<float>,"cache_cuts":<int>,"text":"<string>"}
 BMOE_ERROR {"id":<int>,"fatal":<bool>,"msg":"<string>"}
 ```
 

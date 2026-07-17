@@ -139,6 +139,22 @@ private:
     // loop that follows drains any shrink.
     void adapt_cache_budget();
 
+    // Pressure sensing (cache_dynamic): sample (throttled) how much of the cache the kernel still
+    // has in RAM, walking the LRU cold end — the pages reclaim takes first, so a dip here is the
+    // earliest evidence the budget outgrew what the device concedes. Sets resident_frac_ for the
+    // governor; changes no budget itself. Eval-thread only (it walks the LRU list).
+    void sample_residency();
+
+    // Companion sensor for the OTHER half of memory: the dense weights, which are mmap'd file-backed
+    // and reclaimed by being dropped (never swapped), so resident_frac — which watches only our anon
+    // cache — is blind to them. A stratified mincore over the dense file ranges says how much of the
+    // model itself the kernel still has. When this falls while resident_frac holds, the faults are
+    // the weights, not the cache, and shrinking the cache cannot help. Sets dense_resident_frac_.
+    void sample_dense_residency();
+
+    // Accumulate one token's routed working set. Eval-thread only, called per layer load.
+    void account_demand(int il, int n_unique);
+
     bool load_layer_async(int il, const int32_t * ids, int n_ids); // overlap path
 
     static void c_expert_ready(const ggml_tensor * src0, int expert, void * user_data);
@@ -185,8 +201,43 @@ private:
     size_t cache_target_ = 0;
     size_t total_expert_bytes_ = 0;
     size_t cache_hard_cap_ = 0; // upper bound on the auto budget (ceiling ∧ full expert-set size)
-    unsigned probe_tick_ = 0;   // throttles the mem_available re-probe (once per N load_layer calls)
+    unsigned probe_tick_ = 0;   // throttles the periodic sensing (once per N load_layer calls)
     long long cache_resizes_ = 0;
+
+    // ── pressure sensing (cache_dynamic): the engine senses, bmoe::CacheGovernor decides ──
+    // Sampling the whole cache every layer would cost more than the reclaim it detects, so a probe
+    // reads a bounded window of the cold end. Cost lands in mgmt_ns_, where a regression is visible
+    // rather than hidden in the compute residual.
+    static constexpr unsigned residency_probe_every = 128; // load_layer calls between probes (~2-3 tokens)
+    static constexpr int residency_sample_entries = 16;    // coldest entries read per probe
+    static constexpr int dense_sample_pages = 256;         // stratified probe points over the dense weights
+    bool cache_dynamic_ = false;
+    double resident_frac_ = -1.0;       // last sampled cache residency; -1 = never measured
+    double dense_resident_frac_ = -1.0; // last sampled dense-weight residency; -1 = never measured
+
+    // The dense weights' byte ranges in the file (complement of the expert ranges), and the mmap VMAs
+    // that back them — resolved once, lazily, from /proc/self/maps. Empty vma set = maps unreadable,
+    // which keeps dense_resident_frac_ at -1 rather than inventing a number.
+    std::string gguf_path_;
+    std::vector<std::pair<uint64_t, uint64_t>> dense_ranges_;
+    std::vector<pio::MappedRegion> dense_vmas_;
+    bool dense_vmas_tried_ = false;
+
+    // Two measured demands, and the difference between them decides the whole policy.
+    //
+    // token_demand_: the bytes routed between two visits to the same layer — one token's working
+    // set. Below it the cache stops holding anything BETWEEN tokens, so its hit rate collapses to
+    // inter-token correlation only. Informative (it says where hits start), never a floor: measured
+    // on gpt-oss it is 1815 MiB, more than the device concedes, so flooring there just pins the
+    // budget inside a war it cannot win. See bmoe/cache_governor.h.
+    //
+    // layer_demand_: the largest single layer's routed bytes. THIS is the floor, because it is
+    // mechanical — the cache has to hold the layer it is staging right now.
+    size_t demand_accum_ = 0;
+    size_t token_demand_ = 0;
+    size_t layer_demand_accum_ = 0;
+    size_t layer_demand_ = 0;
+    int last_il_ = -1;
     std::vector<void *> lbuf_[MoeRecipe::max_exps];
     std::vector<size_t> lbuf_sz_[MoeRecipe::max_exps];
     std::vector<uint8_t> cvalid_;

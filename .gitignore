@@ -32,7 +32,6 @@ examples/android/captures/
 # IDE / editor
 .vscode/
 .idea/
-.claude/
 *.swp
 *~
 

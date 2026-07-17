@@ -10,8 +10,10 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <ctime>
@@ -24,6 +26,16 @@
 #endif
 
 namespace bmoe::pio {
+
+#if !defined(_WIN32)
+// mincore's vector argument is `unsigned char *` on Linux/Android but `char *` on the BSDs and
+// macOS. Name the difference once instead of casting blind at the call site.
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+using mincore_vec_t = char;
+#else
+using mincore_vec_t = unsigned char;
+#endif
+#endif
 
 #if defined(_WIN32)
 
@@ -87,6 +99,17 @@ void vm_release(void * p, size_t /*sz*/) {
     if (p) VirtualFree(p, 0, MEM_RELEASE);
 }
 
+// Unmeasured on the host build, like the fault counters below and for the same reason: the gates
+// prove byte-identity, they do not size a cache against a phone's reclaim. QueryWorkingSetEx could
+// answer this, but nothing here consumes it.
+bool vm_resident_sample(const void * /*p*/, size_t /*sz*/, size_t * /*sampled*/, size_t * /*resident*/) {
+    return false;
+}
+
+bool file_mapped_regions(const char * /*basename*/, std::vector<MappedRegion> & /*out*/) {
+    return false; // no /proc/self/maps; the host gates do not exercise dense residency
+}
+
 uint64_t mem_available_bytes() {
     MEMORYSTATUSEX ms;
     ms.dwLength = sizeof(ms);
@@ -101,6 +124,24 @@ uint64_t major_faults() {
 }
 double process_cpu_seconds() {
     return 0.0;
+}
+
+size_t fault_bytes() {
+    return vm_page();
+}
+
+bool process_memory(ProcessMemory * /*out*/) {
+    return false;
+}
+
+bool device_memory(DeviceMemory * out) {
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) return false;
+    out->available_bytes = (uint64_t) ms.ullAvailPhys;
+    out->free_bytes = (uint64_t) ms.ullAvailPhys; // no separate "free vs reclaimable" here
+    out->swap_free_bytes = (uint64_t) ms.ullAvailPageFile;
+    return true;
 }
 
 #else
@@ -154,6 +195,26 @@ void vm_release(void * p, size_t sz) {
     if (p) munmap(p, sz);
 }
 
+bool vm_resident_sample(const void * p, size_t sz, size_t * sampled, size_t * resident) {
+    if (!p || sz == 0) return true; // an empty range is measured, and holds nothing
+    const size_t page = vm_page();
+    // Clip to the pages FULLY inside the range, matching how the eviction path releases them: an
+    // edge page shared with a neighbouring slice belongs to that neighbour, not to this sample.
+    uintptr_t a0 = ((uintptr_t) p + page - 1) & ~(uintptr_t) (page - 1);
+    uintptr_t a1 = ((uintptr_t) p + sz) & ~(uintptr_t) (page - 1);
+    if (a1 <= a0) return true;
+    unsigned char vec[512]; // one byte per page: 512 pages (2 MiB at 4 KiB pages) per syscall
+    for (uintptr_t a = a0; a < a1;) {
+        const size_t want = std::min<size_t>((size_t) (a1 - a) / page, sizeof(vec));
+        if (mincore((void *) a, want * page, (mincore_vec_t *) vec) != 0) return false;
+        for (size_t i = 0; i < want; ++i)
+            *resident += (size_t) (vec[i] & 1u); // bit 0 = the page is resident
+        *sampled += want;
+        a += want * page;
+    }
+    return true;
+}
+
 uint64_t mem_available_bytes() {
     // Linux/Android: MemAvailable is the kernel's own estimate of what can be allocated without
     // swapping (it accounts for reclaimable page cache), which is exactly the sizing signal we want.
@@ -193,6 +254,90 @@ double process_cpu_seconds() {
     if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) == 0) return (double) ts.tv_sec + ts.tv_nsec * 1e-9;
 #endif
     return 0.0;
+}
+
+size_t fault_bytes() {
+    // One major fault brings back one page. The kernel can fault a cluster in around a single miss,
+    // so this is the floor of what a fault moved, not an upper bound — it under-reports rather than
+    // inventing, which is the right direction for a number a reader will compare against real reads.
+    return vm_page();
+}
+
+// Scan a "Key: <n> kB" file for the keys we want in one pass, rather than one open per field.
+namespace {
+bool scan_kb_file(const char * path, const char * const * keys, uint64_t * out, int n) {
+    FILE * f = std::fopen(path, "re");
+    if (!f) return false;
+    char line[256];
+    int found = 0;
+    while (found < n && std::fgets(line, sizeof(line), f)) {
+        for (int i = 0; i < n; ++i) {
+            if (out[i]) continue; // already have it
+            const size_t klen = std::strlen(keys[i]);
+            if (std::strncmp(line, keys[i], klen) != 0 || line[klen] != ':') continue;
+            unsigned long long kb = 0;
+            if (std::sscanf(line + klen + 1, " %llu kB", &kb) == 1) {
+                out[i] = (uint64_t) kb * 1024ull;
+                ++found;
+            }
+            break;
+        }
+    }
+    std::fclose(f);
+    return found > 0;
+}
+} // namespace
+
+bool process_memory(ProcessMemory * out) {
+    static const char * const keys[] = {"VmRSS", "RssAnon", "RssFile", "VmSwap", "VmHWM"};
+    uint64_t v[5] = {0, 0, 0, 0, 0};
+    if (!scan_kb_file("/proc/self/status", keys, v, 5)) return false;
+    out->rss_bytes = v[0];
+    out->rss_anon_bytes = v[1];
+    out->rss_file_bytes = v[2];
+    out->swap_bytes = v[3];
+    out->rss_peak_bytes = v[4];
+    return true;
+}
+
+bool device_memory(DeviceMemory * out) {
+    static const char * const keys[] = {"MemAvailable", "MemFree", "SwapFree"};
+    uint64_t v[3] = {0, 0, 0};
+    if (!scan_kb_file("/proc/meminfo", keys, v, 3)) return false;
+    out->available_bytes = v[0];
+    out->free_bytes = v[1];
+    out->swap_free_bytes = v[2];
+    return true;
+}
+
+bool file_mapped_regions(const char * basename, std::vector<MappedRegion> & out) {
+    FILE * f = std::fopen("/proc/self/maps", "re");
+    if (!f) return false;
+    const size_t blen = std::strlen(basename);
+    char line[512];
+    bool any = false;
+    // Each line: "start-end perms offset dev inode   pathname". We want the VMAs whose pathname ends
+    // with the model's file name — an mmap of a large file appears as one or more such VMAs.
+    while (std::fgets(line, sizeof(line), f)) {
+        unsigned long long start = 0, end = 0, off = 0;
+        // The pathname is the last field; sscanf %n gives us where the fixed part ended so we can
+        // scan the remainder for it without copying.
+        int consumed = 0;
+        if (std::sscanf(line, "%llx-%llx %*s %llx %*s %*s %n", &start, &end, &off, &consumed) < 3) continue;
+        const char * path = line + consumed;
+        // Trim the trailing newline and any leading spaces %n may have left.
+        while (*path == ' ')
+            ++path;
+        size_t plen = std::strlen(path);
+        while (plen && (path[plen - 1] == '\n' || path[plen - 1] == ' '))
+            --plen;
+        if (plen < blen) continue;
+        if (std::strncmp(path + plen - blen, basename, blen) != 0) continue;
+        out.push_back({(uintptr_t) start, (uintptr_t) end, (uint64_t) off});
+        any = true;
+    }
+    std::fclose(f);
+    return any;
 }
 
 #endif
