@@ -227,36 +227,23 @@ compute. No llama.cpp sources are modified. Design and the exact API contract:
 
 ## Telemetry
 
-Streaming a model past RAM fails in ways that all look the same from the outside: it's just slow.
-The engine is instrumented so you can tell *which* slow you have.
+A model streamed past RAM fails in ways that all look identical from outside: it's just slow. So
+every run accounts for its own time. `--progress` breaks each token down into flash I/O, cache
+management and compute, next to the cache hit rate and the bytes read; `--csv` adds the memory
+picture those numbers have to be read against. The Android app renders the same feed live while you
+chat, which is how you watch a phone quietly take its memory back mid-answer.
 
-`--progress` emits one line per token (`BMOE_PROGRESS {json}`) with wall time split into flash I/O,
-cache management and compute, plus cache hit rate, bytes read, and the overlap stall. `--csv PATH`
-writes the same per token, plus the memory picture the numbers have to be read against: resident
-anonymous vs file-backed memory, what zram already took, what the device claims is available. The
-Android app parses the same lines and renders them live while you chat.
+What makes it worth reading is that the engine is candid about its own numbers. Compute, in
+particular, isn't measured: it's whatever time is left once the measured parts come out, so it
+silently absorbs page faults and throttled cores. Rather than let that pass, the engine ships the
+counters that pull the residual apart, and marks anything it couldn't measure as unmeasured instead
+of quietly reporting zero.
 
-The part worth stealing is that **the engine reports which of its own numbers are not measured**:
+When the per-token split isn't enough, two diagnostics go further: one records what the router
+asked for on every token, the other times the compute graph node by node. Both perturb the run they
+measure, and both say so.
 
-- **`compute_ms` is a residual, not a measurement.** No clock runs around llama.cpp's matmuls, so
-  compute is whatever wall time is left after the measured terms come out. It silently absorbs page
-  faults and scheduler stalls, which on a >RAM model is most of it.
-- **So the residual gets decomposed.** `majflt` counts major faults inside `llama_decode`: non-zero
-  means a dense weight re-faulted from flash, a residency stall wearing compute's clothes. `cpu_ms`
-  against `wall_ms × threads` gives occupancy: near 100% is genuinely compute-bound, well below
-  means throttled or preempted cores, not more math.
-- **Unmeasured is a distinct value.** `0` where a platform can't report a counter, `-1` where a
-  probe didn't run, `nan` for a routing weight the graph never exposed. Never a plausible-looking
-  zero.
-
-Two diagnostics go deeper when the per-token split isn't enough. `--route-trace` records which
-experts every token routed to, per layer, with the weight and whether it was already resident;
-`--compute-trace` times each individual graph node by returning `true` from the eval callback, so
-compute stops being a residual and becomes measured. Both perturb the run that produces them and
-both say so: a traced run is not a benchmark run.
-
-Line protocol, CSV schema and the trace formats are versioned in
-[docs/telemetry.md](docs/telemetry.md). CSV columns are additive, so read them by name.
+Formats and schemas: [docs/telemetry.md](docs/telemetry.md).
 
 ## Documentation
 
