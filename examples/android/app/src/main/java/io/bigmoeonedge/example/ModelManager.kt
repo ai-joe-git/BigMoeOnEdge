@@ -45,10 +45,14 @@ object ModelManager {
         }
     }
 
+    // Deduped by filename, not by path: the same gguf often exists in two scanned dirs (imported
+    // and adb-pushed). The first hit wins, so scanDirs order is a precedence list — the internal
+    // dir (O_DIRECT works) before the emulated external dirs. It also lets the model catalog
+    // recognize its own entries by name, wherever they landed.
     private fun allGguf(ctx: Context): List<File> =
         scanDirs(ctx)
             .flatMap { it.listFiles { f -> f.isFile && f.name.endsWith(".gguf") }?.toList() ?: emptyList() }
-            .distinctBy { it.absolutePath }
+            .distinctBy { it.name }
             .sortedBy { it.name }
 
     /** List MoE models only. Blocking header reads — call off the main thread. */
@@ -61,11 +65,11 @@ object ModelManager {
     /** Empty-state guidance, phrased for the current flavor's model-acquisition paths. */
     fun pushHint(): String =
         if (BuildConfig.SHARED_STORAGE) {
-            "No MoE .gguf found. Add one below (download by URL or pick a file), or adb-push a\n" +
-                "model to shared storage:\n" +
-                "adb push model.gguf /sdcard/Download/"
+            "No MoE .gguf found. Download one below, or adb-push a model to shared storage:\n" +
+                "adb push model.gguf /sdcard/Download/\n" +
+                "adb push model.gguf /data/local/tmp/bmoe/   (no duplicate, O_DIRECT works)"
         } else {
-            "No MoE .gguf found. Add one below: download by URL, or pick a .gguf you already\n" +
-                "have on the device."
+            "No MoE .gguf found. Download one below, or pick a .gguf you already have on the\n" +
+                "device."
         }
 }

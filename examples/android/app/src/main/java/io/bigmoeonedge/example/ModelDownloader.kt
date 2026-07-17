@@ -29,15 +29,34 @@ object ModelDownloader {
 
     /**
      * Start a download. Returns the DownloadManager id, or an error if the URL doesn't name a
-     * .gguf file. No model names or hosts are assumed — the filename comes from the URL.
+     * .gguf file or the model cannot fit. No model names or hosts are assumed — for a pasted URL
+     * the filename comes from the URL itself.
+     *
+     * [fileName] overrides that for catalog downloads, where the on-disk name is known upfront
+     * and must not depend on redirects or query strings. [expectedBytes] (when > 0) is checked
+     * against free space before enqueuing: DownloadManager would fail with
+     * ERROR_INSUFFICIENT_SPACE anyway, but only after the user waited for it to try.
      */
-    fun enqueue(ctx: Context, rawUrl: String): Result<Long> = runCatching {
+    fun enqueue(
+        ctx: Context,
+        rawUrl: String,
+        fileName: String? = null,
+        expectedBytes: Long = -1L,
+    ): Result<Long> = runCatching {
         val url = rawUrl.trim()
         val uri = Uri.parse(url)
         require(uri.scheme == "http" || uri.scheme == "https") { "URL must be http(s)" }
 
-        val name = fileNameFromUrl(uri)
+        val name = fileName ?: fileNameFromUrl(uri)
         require(name.endsWith(".gguf")) { "URL must point to a .gguf file" }
+
+        val dir = ModelManager.appModelsDir(ctx) ?: error("no writable app storage")
+        if (expectedBytes > 0 && expectedBytes > dir.usableSpace) {
+            error(
+                "not enough free space: needs ${expectedBytes shr 30} GiB, " +
+                    "${dir.usableSpace shr 30} GiB free"
+            )
+        }
 
         val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         val req = DownloadManager.Request(uri)
@@ -76,6 +95,29 @@ object ModelDownloader {
             }
             return Progress(id, title, soFar, total, state, reason)
         }
+    }
+
+    /**
+     * Model downloads this app still has in flight, as filename -> DownloadManager id.
+     *
+     * DownloadManager outlives the app process, so a download started before the app was killed
+     * is still running when the user comes back. The UI seeds itself from this instead of losing
+     * track of a multi-GB transfer. Only our own downloads are visible to this query.
+     */
+    fun activeDownloads(ctx: Context): Map<String, Long> {
+        val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val q = DownloadManager.Query().setFilterByStatus(
+            DownloadManager.STATUS_PENDING or DownloadManager.STATUS_RUNNING or DownloadManager.STATUS_PAUSED
+        )
+        val out = mutableMapOf<String, Long>()
+        dm.query(q)?.use { c ->
+            while (c.moveToNext()) {
+                val title = c.getString(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TITLE)) ?: continue
+                val id = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_ID))
+                if (title.endsWith(".gguf")) out.putIfAbsent(title, id)
+            }
+        }
+        return out
     }
 
     /**
