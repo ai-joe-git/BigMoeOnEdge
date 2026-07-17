@@ -39,20 +39,40 @@ Two build flavors differ only in how a model reaches the device:
 
 ## Getting a model onto the device
 
-Any of these — the picker lists every MoE `.gguf` it finds (dense models are filtered out by
-a gguf-header check):
+The picker lists every MoE `.gguf` it finds (dense models are filtered out by a gguf-header
+check). Nothing below needs a storage permission except the last option.
 
-1. **In-app URL download** (both flavors). Tap **Add → Download** and paste a direct gguf URL
-   (e.g. a Hugging Face `…/resolve/main/model.gguf` link). It downloads in the background to
-   the app's files dir — no permission needed — and appears in the picker when done.
-2. **In-app file picker** (both flavors). Tap **Add → Pick file** and choose a `.gguf` already
-   on the device; it is imported into the app's files dir.
+1. **Built-in catalog** (both flavors) — the "Get a model" card offers the models this engine
+   is measured on, each a single tap: **Qwen3-30B-A3B-Q4_K_M** (~18.5 GB, the reference model)
+   and **Gemma-4-26B-A4B-it-Q4_K_M** (~17 GB). Downloads run in the background, survive the app
+   being killed, and appear in the picker when done.
+2. **Any other model** — under **Other model**, paste a direct gguf URL (e.g. a Hugging Face
+   `…/resolve/main/model.gguf` link), or pick a `.gguf` already on the device to import it.
 3. **adb push** (dev flavor only — needs all-files access, which the dev build requests):
 
    ```bash
    adb push Qwen3-30B-A3B-Q4_K_M.gguf /sdcard/Download/
-   # or the app's own dir, or /data/local/tmp/shardllm for a model too big to duplicate
+   # /data/local/tmp/bmoe avoids duplicating a model too big to copy, and is on a real
+   # filesystem where O_DIRECT works (the emulated dirs fall back to buffered I/O)
+   adb push Qwen3-30B-A3B-Q4_K_M.gguf /data/local/tmp/bmoe/
    ```
+
+   This directory was named `shardllm` before v0.8.0. To keep models already pushed there:
+
+   ```bash
+   adb shell mv /data/local/tmp/shardllm /data/local/tmp/bmoe
+   ```
+
+### gpt-oss-120b
+
+Listed in the catalog but not downloadable in-app: Hugging Face ships the Q4_K_M quant as two
+shards (the 50 GB per-file limit), and expert streaming reads tensors by byte offset from a
+single file. Merge the shards on a PC, then transfer the result:
+
+```bash
+llama-gguf-split --merge gpt-oss-120b-Q4_K_M-00001-of-00002.gguf gpt-oss-120b-Q4_K_M.gguf
+adb push gpt-oss-120b-Q4_K_M.gguf /data/local/tmp/bmoe/   # or import it with the file picker
+```
 
 ## Expected numbers
 
