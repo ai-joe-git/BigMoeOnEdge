@@ -12,10 +12,12 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -25,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -220,9 +223,10 @@ private fun MainScreen(
                         )
                     }
 
-                    // Bring a model onto the device without adb: download by URL or pick a local file.
-                    // Both land in the app models dir; on completion we re-scan so it appears above.
-                    AddModelSection(onModelReady = onRefresh)
+                    // Bring a model onto the device without adb: the built-in catalog, an arbitrary
+                    // URL, or a local file. All land in the app models dir; on completion we
+                    // re-scan so the model appears above.
+                    AddModelSection(models = models, scanning = scanning, onModelReady = onRefresh)
 
                     OutlinedTextField(
                         value = prompt,
@@ -363,22 +367,42 @@ private fun configSummary(s: AppSettings): String {
 }
 
 /**
- * "Add a model" card: download a gguf by URL (DownloadManager) or import one the user already
- * has via the system file picker (SAF). Both write to the app models dir with no permission;
- * [onModelReady] triggers a re-scan so the new model shows up in the picker above.
+ * "Get a model" card: one-tap downloads of the models this engine is measured on ([ModelCatalog]),
+ * plus the escape hatches — any gguf URL (DownloadManager) or a file the user already has (SAF
+ * picker). Everything lands in the app models dir with no permission; [onModelReady] triggers a
+ * re-scan so the new model shows up in the picker above.
+ *
+ * [models] is the current scan result: it is what tells a catalog entry it is already on device.
  */
 @Composable
-private fun AddModelSection(onModelReady: () -> Unit) {
+private fun AddModelSection(models: List<File>, scanning: Boolean, onModelReady: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
     var url by rememberSaveable { mutableStateOf("") }
     var expanded by rememberSaveable { mutableStateOf(false) }
-    var downloadId by rememberSaveable { mutableStateOf(-1L) }
-    var progress by remember { mutableStateOf<ModelDownloader.Progress?>(null) }
+    var showInstall by rememberSaveable { mutableStateOf<String?>(null) }
+    // Null until the first scan finishes: on a first run the card opens itself, on a device that
+    // already has a model it stays out of the way. Deciding before the scan lands would flash the
+    // whole catalog open on every launch.
+    var open by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    LaunchedEffect(scanning) { if (!scanning && open == null) open = models.isEmpty() }
+    val isOpen = open == true
+    // filename -> DownloadManager id. Seeded from DownloadManager rather than remembered, so a
+    // transfer started before the app was killed is picked back up instead of running unseen.
+    var downloads by remember { mutableStateOf<Map<String, Long>>(emptyMap()) }
+    var progress by remember { mutableStateOf<Map<String, ModelDownloader.Progress>>(emptyMap()) }
     var importStatus by remember { mutableStateOf<String?>(null) }
     var importFrac by remember { mutableStateOf(-1f) }
     var error by remember { mutableStateOf<String?>(null) }
+    // A catalog failure belongs to the row whose button was tapped: filename -> message. Reported
+    // at the bottom of the card it would surface under a different heading entirely.
+    var rowError by remember { mutableStateOf<Pair<String, String>?>(null) }
+
+    val present = remember(models) { models.map { it.name }.toSet() }
+    val reseed = { downloads = ModelDownloader.activeDownloads(context) }
+
+    LaunchedEffect(Unit) { reseed() }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
@@ -396,20 +420,32 @@ private fun AddModelSection(onModelReady: () -> Unit) {
         }
     }
 
-    // Poll an active download to completion, then finalize (.part → .gguf) and re-scan.
-    LaunchedEffect(downloadId) {
-        if (downloadId < 0) return@LaunchedEffect
+    // Poll the in-flight downloads; finalize each (.part → .gguf) as it lands and re-scan. The
+    // effect restarts whenever the set changes, which is also how it stops.
+    LaunchedEffect(downloads) {
+        if (downloads.isEmpty()) return@LaunchedEffect
         while (true) {
-            val p = ModelDownloader.query(context, downloadId) ?: break
-            progress = p
-            if (p.state == ModelDownloader.State.SUCCESS) {
-                ModelDownloader.finalizeDownload(context, p.name)
-                downloadId = -1L; progress = null; onModelReady()
-                break
+            val finished = mutableSetOf<String>()
+            val live = mutableMapOf<String, ModelDownloader.Progress>()
+            for ((name, id) in downloads) {
+                val p = ModelDownloader.query(context, id)
+                when {
+                    p == null -> finished += name
+                    p.state == ModelDownloader.State.SUCCESS -> {
+                        ModelDownloader.finalizeDownload(context, name)
+                        finished += name
+                    }
+                    p.state == ModelDownloader.State.FAILED -> {
+                        error = "$name: ${p.reason ?: "download failed"}"
+                        finished += name
+                    }
+                    else -> live[name] = p
+                }
             }
-            if (p.state == ModelDownloader.State.FAILED) {
-                error = p.reason ?: "download failed"
-                downloadId = -1L; progress = null
+            progress = live
+            if (finished.isNotEmpty()) {
+                downloads = downloads - finished
+                onModelReady()
                 break
             }
             delay(700)
@@ -418,11 +454,60 @@ private fun AddModelSection(onModelReady: () -> Unit) {
 
     ElevatedCard(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Collapsible: once a model is on the device this card is just in the way, but it has
+            // to stay reachable to add a second one.
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Add a model", fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "Hide" else "Add") }
+                Column(Modifier.weight(1f)) {
+                    Text("Get a model", fontWeight = FontWeight.SemiBold)
+                    if (!isOpen && downloads.isNotEmpty()) {
+                        Text(
+                            "${downloads.size} downloading…",
+                            fontSize = 12.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                TextButton(onClick = { open = !isOpen }) { Text(if (isOpen) "Close" else "Open") }
             }
-            if (expanded) {
+
+            if (isOpen) {
+                ModelCatalog.entries.forEach { e ->
+                    CatalogRow(
+                        entry = e,
+                        status = ModelCatalog.statusOf(e, present, downloads.keys),
+                        progress = progress[e.fileName],
+                        installShown = showInstall == e.fileName,
+                        error = rowError?.takeIf { it.first == e.fileName }?.second,
+                        onToggleInstall = { showInstall = if (showInstall == e.fileName) null else e.fileName },
+                        onDownload = {
+                            error = null
+                            rowError = null
+                            ModelDownloader.enqueue(context, e.url ?: "", e.fileName, e.approxBytes)
+                                .onSuccess { reseed() }
+                                .onFailure {
+                                    rowError = e.fileName to (it.message ?: "download failed to start")
+                                }
+                        },
+                        onCancel = {
+                            downloads[e.fileName]?.let { ModelDownloader.cancel(context, it, e.fileName) }
+                            reseed()
+                        },
+                    )
+                }
+
+                HorizontalDivider()
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Other model", fontSize = 14.sp, modifier = Modifier.weight(1f))
+                    TextButton(onClick = { expanded = !expanded }) { Text(if (expanded) "Hide" else "Show") }
+                }
+            }
+            if (isOpen && expanded) {
+                Text(
+                    "Any MoE gguf works — paste a direct link, or pick a file already on the device.",
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 OutlinedTextField(
                     value = url,
                     onValueChange = { url = it },
@@ -435,10 +520,10 @@ private fun AddModelSection(onModelReady: () -> Unit) {
                         onClick = {
                             error = null
                             ModelDownloader.enqueue(context, url)
-                                .onSuccess { downloadId = it }
+                                .onSuccess { reseed() }
                                 .onFailure { error = it.message ?: "invalid URL" }
                         },
-                        enabled = url.isNotBlank() && downloadId < 0,
+                        enabled = url.isNotBlank(),
                         modifier = Modifier.weight(1f),
                     ) { Text("Download") }
                     OutlinedButton(
@@ -446,34 +531,17 @@ private fun AddModelSection(onModelReady: () -> Unit) {
                         modifier = Modifier.weight(1f),
                     ) { Text("Pick file") }
                 }
-            }
-
-            progress?.let { p ->
-                val pct = if (p.totalBytes > 0) {
-                    (p.downloadedBytes.toFloat() / p.totalBytes).coerceIn(0f, 1f)
-                } else {
-                    null
-                }
-                Text(
-                    if (pct != null) {
-                        String.format(
-                            Locale.US, "Downloading %s — %d%% (%d/%d MiB)",
-                            p.name, (pct * 100).toInt(), p.downloadedBytes shr 20, p.totalBytes shr 20,
+                // A pasted URL has no catalog row to show its progress in.
+                progress.filterKeys { k -> ModelCatalog.entries.none { it.fileName == k } }
+                    .forEach { (name, p) ->
+                        DownloadProgress(
+                            p,
+                            onCancel = {
+                                ModelDownloader.cancel(context, p.id, name)
+                                reseed()
+                            },
                         )
-                    } else {
-                        "Downloading ${p.name}…"
-                    },
-                    fontSize = 12.sp,
-                )
-                if (pct != null) {
-                    LinearProgressIndicator(progress = { pct }, modifier = Modifier.fillMaxWidth())
-                } else {
-                    LinearProgressIndicator(Modifier.fillMaxWidth())
-                }
-                TextButton(onClick = {
-                    ModelDownloader.cancel(context, p.id, p.name)
-                    downloadId = -1L; progress = null
-                }) { Text("Cancel") }
+                    }
             }
 
             importStatus?.let { st ->
@@ -488,6 +556,120 @@ private fun AddModelSection(onModelReady: () -> Unit) {
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, fontSize = 12.sp) }
         }
     }
+}
+
+/** One catalog model: what it is, how big, and the single action its current state allows. */
+@Composable
+private fun CatalogRow(
+    entry: ModelCatalog.Entry,
+    status: ModelCatalog.Status,
+    progress: ModelDownloader.Progress?,
+    installShown: Boolean,
+    error: String?,
+    onToggleInstall: () -> Unit,
+    onDownload: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        // Name and action share a line; the blurb gets the full card width on its own line. Next
+        // to a button there is not enough room left for a sentence, and it wraps to a stack of
+        // one-word lines.
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                entry.title,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            when (status) {
+                ModelCatalog.Status.AVAILABLE ->
+                    Button(onClick = onDownload, contentPadding = PaddingValues(horizontal = 16.dp)) {
+                        Text("Download", maxLines = 1, softWrap = false)
+                    }
+                ModelCatalog.Status.DOWNLOADING ->
+                    TextButton(onClick = onCancel) { Text("Cancel", maxLines = 1, softWrap = false) }
+                ModelCatalog.Status.ON_DEVICE ->
+                    Text(
+                        "On device",
+                        fontSize = 13.sp,
+                        maxLines = 1,
+                        softWrap = false,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                ModelCatalog.Status.MANUAL_ONLY ->
+                    TextButton(onClick = onToggleInstall) {
+                        Text(if (installShown) "Hide" else "How to", maxLines = 1, softWrap = false)
+                    }
+            }
+        }
+        Text(
+            "${entry.quant} · ${ModelCatalog.sizeLabel(entry)} · ${entry.blurb}",
+            fontSize = 12.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        if (error != null) {
+            Text(error, fontSize = 12.sp, color = MaterialTheme.colorScheme.error)
+        }
+        if (progress != null) DownloadProgress(progress, onCancel = null, showName = false)
+        if (installShown) {
+            entry.install?.let {
+                // Commands must stay copy-pasteable, so they scroll sideways rather than wrap:
+                // a wrapped shell line is a broken shell line.
+                SelectionContainer {
+                    Text(
+                        it,
+                        fontFamily = FontFamily.Monospace,
+                        fontSize = 11.sp,
+                        softWrap = false,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(vertical = 4.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Progress line + bar for one download. [onCancel] null when the row already offers Cancel;
+ * [showName] false inside a catalog row, where the title is already on the line above.
+ */
+@Composable
+private fun DownloadProgress(
+    p: ModelDownloader.Progress,
+    onCancel: (() -> Unit)?,
+    showName: Boolean = true,
+) {
+    val pct = if (p.totalBytes > 0) {
+        (p.downloadedBytes.toFloat() / p.totalBytes).coerceIn(0f, 1f)
+    } else {
+        null
+    }
+    val prefix = if (showName) "${p.name} — " else ""
+    Text(
+        when {
+            p.state == ModelDownloader.State.PAUSED -> prefix + (p.reason ?: "paused")
+            pct != null -> prefix + String.format(
+                Locale.US, "%d%% (%d/%d MiB)",
+                (pct * 100).toInt(), p.downloadedBytes shr 20, p.totalBytes shr 20,
+            )
+            else -> if (showName) "Downloading ${p.name}…" else "Starting…"
+        },
+        fontSize = 12.sp,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+    if (pct != null) {
+        LinearProgressIndicator(progress = { pct }, modifier = Modifier.fillMaxWidth())
+    } else {
+        LinearProgressIndicator(Modifier.fillMaxWidth())
+    }
+    onCancel?.let { TextButton(onClick = it) { Text("Cancel") } }
 }
 
 @Composable

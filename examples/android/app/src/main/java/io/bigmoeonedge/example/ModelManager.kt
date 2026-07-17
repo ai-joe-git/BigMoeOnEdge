@@ -12,7 +12,7 @@ import java.io.File
  *
  *   always      the app-specific external files dir — no permission needed. The in-app URL
  *               downloader and the file picker both land models here.
- *   dev only    the public Downloads folder and /data/local/tmp/shardllm, for models adb-pushed
+ *   dev only    the public Downloads folder and /data/local/tmp/bmoe, for models adb-pushed
  *               to the device. These need all-files access, which only the dev flavor requests.
  *
  * Only MoE models are listed: this engine streams experts, so dense models are filtered out by
@@ -23,7 +23,7 @@ object ModelManager {
     // still be adb-pushed to /data/local/tmp (same physical partition, no duplicate needed) and
     // read in place: the path is world-traversable and the file world-readable, so the app's
     // untrusted_app domain can open it.
-    private val TMP_MODEL_DIR = File("/data/local/tmp/shardllm")
+    private val TMP_MODEL_DIR = File("/data/local/tmp/bmoe")
 
     /** The app-specific external files dir — the download target, readable with no permission. */
     fun appModelsDir(ctx: Context): File? = ctx.getExternalFilesDir(null)
@@ -36,19 +36,27 @@ object ModelManager {
      */
     fun internalModelsDir(ctx: Context): File = File(ctx.filesDir, "models").apply { mkdirs() }
 
+    // Order is precedence, not taste: allGguf keeps the first file of a given name, and the same
+    // gguf really does sit in two places at once (adb-pushed to /data/local/tmp *and* downloaded
+    // to /sdcard/Download). Real filesystems come first, because O_DIRECT works there and the
+    // emulated dirs force the engine back onto buffered I/O. Reading the slow copy of a model
+    // that is also present on the fast one is a silent, unexplained loss of throughput.
     private fun scanDirs(ctx: Context): List<File> = buildList {
         add(internalModelsDir(ctx))
+        if (BuildConfig.SHARED_STORAGE && TMP_MODEL_DIR.isDirectory) add(TMP_MODEL_DIR)
         appModelsDir(ctx)?.let { add(it) }
         if (BuildConfig.SHARED_STORAGE) {
             Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)?.let { add(it) }
-            if (TMP_MODEL_DIR.isDirectory) add(TMP_MODEL_DIR)
         }
     }
 
+    // Deduped by filename, not by path: the same gguf often exists in two scanned dirs (imported
+    // and adb-pushed). The first hit wins — see scanDirs for the precedence. It also lets the
+    // model catalog recognize its own entries by name, wherever they landed.
     private fun allGguf(ctx: Context): List<File> =
         scanDirs(ctx)
             .flatMap { it.listFiles { f -> f.isFile && f.name.endsWith(".gguf") }?.toList() ?: emptyList() }
-            .distinctBy { it.absolutePath }
+            .distinctBy { it.name }
             .sortedBy { it.name }
 
     /** List MoE models only. Blocking header reads — call off the main thread. */
@@ -61,11 +69,11 @@ object ModelManager {
     /** Empty-state guidance, phrased for the current flavor's model-acquisition paths. */
     fun pushHint(): String =
         if (BuildConfig.SHARED_STORAGE) {
-            "No MoE .gguf found. Add one below (download by URL or pick a file), or adb-push a\n" +
-                "model to shared storage:\n" +
-                "adb push model.gguf /sdcard/Download/"
+            "No MoE .gguf found. Download one below, or adb-push a model to shared storage:\n" +
+                "adb push model.gguf /sdcard/Download/\n" +
+                "adb push model.gguf /data/local/tmp/bmoe/   (no duplicate, O_DIRECT works)"
         } else {
-            "No MoE .gguf found. Add one below: download by URL, or pick a .gguf you already\n" +
-                "have on the device."
+            "No MoE .gguf found. Download one below, or pick a .gguf you already have on the\n" +
+                "device."
         }
 }
