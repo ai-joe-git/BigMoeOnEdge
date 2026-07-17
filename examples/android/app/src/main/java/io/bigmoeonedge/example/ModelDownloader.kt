@@ -71,11 +71,11 @@ object ModelDownloader {
         dm.enqueue(req)
     }
 
-    /** Current status of a download, or null if the id is unknown. */
-    fun query(ctx: Context, id: Long): Progress? {
+    /** Current status of a download, or null if the id is unknown or the provider refused. */
+    fun query(ctx: Context, id: Long): Progress? = runCatching {
         val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         dm.query(DownloadManager.Query().setFilterById(id)).use { c ->
-            if (c == null || !c.moveToFirst()) return null
+            if (c == null || !c.moveToFirst()) return@runCatching null
             val status = c.getInt(c.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
             val soFar = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR))
             val total = c.getLong(c.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES))
@@ -93,9 +93,9 @@ object ModelDownloader {
                 State.PAUSED -> pauseReason(reasonCode)
                 else -> null
             }
-            return Progress(id, title, soFar, total, state, reason)
+            Progress(id, title, soFar, total, state, reason)
         }
-    }
+    }.getOrNull()
 
     /**
      * Model downloads this app still has in flight, as filename -> DownloadManager id.
@@ -103,8 +103,12 @@ object ModelDownloader {
      * DownloadManager outlives the app process, so a download started before the app was killed
      * is still running when the user comes back. The UI seeds itself from this instead of losing
      * track of a multi-GB transfer. Only our own downloads are visible to this query.
+     *
+     * Never throws: this only restores convenience state, and the download provider is a system
+     * component that can refuse the query. An empty map costs the user a progress bar; letting
+     * the exception out would cost them the whole screen.
      */
-    fun activeDownloads(ctx: Context): Map<String, Long> {
+    fun activeDownloads(ctx: Context): Map<String, Long> = runCatching {
         val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
         val q = DownloadManager.Query().setFilterByStatus(
             DownloadManager.STATUS_PENDING or DownloadManager.STATUS_RUNNING or DownloadManager.STATUS_PAUSED
@@ -117,8 +121,8 @@ object ModelDownloader {
                 if (title.endsWith(".gguf")) out.putIfAbsent(title, id)
             }
         }
-        return out
-    }
+        out as Map<String, Long>
+    }.getOrDefault(emptyMap())
 
     /**
      * Finish a successful download: rename `<name>.gguf.part` to `<name>.gguf` in the app models
