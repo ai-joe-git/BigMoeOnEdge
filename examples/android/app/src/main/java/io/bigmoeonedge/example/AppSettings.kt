@@ -3,6 +3,17 @@ package io.bigmoeonedge.example
 import android.content.Context
 
 /**
+ * How the dense (non-expert) weights are kept resident — one policy, mirroring the engine's
+ * `--dense-weights` flag (core/src/moe/dense_weights.h). Replaces the old warm-dense + dense-O_DIRECT
+ * pair of switches, which could express the same policy two ways (or contradict each other).
+ */
+enum class DenseWeights(val flag: String, val label: String, val blurb: String) {
+    MMAP("mmap", "Mmap (baseline)", "Leave the dense weights mmap'd; the kernel faults them in. Slow first tokens on a >RAM model — the A/B baseline."),
+    WARM("warm", "Warm at load", "Page-cache the dense weights once at load, so the first tokens don't fault them in 4 KiB at a time. The default."),
+    ANON("anon", "Anon (O_DIRECT)", "Read the dense weights via O_DIRECT into our own buffers so a reclaim swaps to zram (fast) instead of a slow flash refault. Costs a private copy; A/B lever."),
+}
+
+/**
  * All user-tunable run options, persisted across launches. These map directly to bmoe-cli
  * flags; the Settings screen edits them and [toArgv] builds the command line.
  */
@@ -13,17 +24,13 @@ data class AppSettings(
     val mmap: Boolean = false,          // baseline: no streaming — llama.cpp mmap loads the whole model
     val cacheMb: Int = CACHE_AUTO,      // LRU expert cache budget; Auto / 0 / 500..6000 (see CACHE_CHOICES)
     val cacheCeilMb: Int = 3000,        // with cacheMb=Auto: upper bound on the auto budget (0 = no cap)
-    val cacheDynamic: Boolean = false,  // treat the budget as a ceiling and let the engine find the
-                                        // largest cache the device concedes (--cache-dynamic). Off
-                                        // until it is measured on device, like every other claim here.
     val ioThreads: Int = 4,             // parallel expert-read lanes
     val threads: Int = 4,               // compute threads (-t)
     val nExpertUsed: Int = 0,           // top-k override (0 = model default); lower = faster, changes output
     val nPredict: Int = 48,
     val oDirect: Boolean = true,        // bypass the page cache
     val overlap: Boolean = true,        // read the next experts while the current layer computes
-    val warmDense: Boolean = true,      // page-cache the non-expert weights at load (kills >RAM slow-start)
-    val denseOdirect: Boolean = false,  // experiment: read dense weights via O_DIRECT into our buffers
+    val denseWeights: DenseWeights = DenseWeights.WARM, // dense (non-expert) weight residency policy
     val prefetchLayers: Int = 0,        // temporal prefetch depth K (0 = off); needs the cache
     val thinking: Boolean = false,      // reasoning; off passes --no-think (enable_thinking=false)
     val metricsCsv: Boolean = true,     // write the engine's per-token CSV for this session (--csv)
@@ -72,15 +79,11 @@ data class AppSettings(
             a += listOf("--io-threads", ioThreads.toString())
             if (!oDirect) a += "--no-odirect"
             if (overlap) a += "--overlap"
-            // Warm-up is on by default in the engine; only surface the opt-out flag.
-            if (!warmDense) a += "--no-warm-dense"
-            // Experiment (default off): dense weights via O_DIRECT into our own buffers.
-            if (denseOdirect) a += "--dense-odirect"
+            // Dense (non-expert) weight policy — one canonical flag (mmap | warm | anon).
+            a += listOf("--dense-weights", denseWeights.flag)
             // Auto sizing is a live LRU cache, so it satisfies the prefetch cache requirement.
             val cacheOn = cacheMb == CACHE_AUTO || cacheMb > 0
             if (prefetchLayers > 0 && cacheOn) a += listOf("--prefetch", prefetchLayers.toString())
-            // Same requirement: there is no budget to size at runtime with the cache off.
-            if (cacheDynamic && cacheOn) a += "--cache-dynamic"
         }
         return a
     }
@@ -92,20 +95,19 @@ data class AppSettings(
      * excluded — they vary per request without touching the loaded model.
      */
     fun sessionSignature(modelPath: String): String =
-        listOf(modelPath, mmap, cacheMb, cacheCeilMb, cacheDynamic, ioThreads, threads, nExpertUsed, oDirect,
-               overlap, warmDense, denseOdirect, prefetchLayers)
+        listOf(modelPath, mmap, cacheMb, cacheCeilMb, ioThreads, threads, nExpertUsed, oDirect,
+               overlap, denseWeights, prefetchLayers)
             .joinToString("|")
 
     fun save(ctx: Context) {
         ctx.prefs().edit()
             .putBoolean("mmap", mmap)
             .putInt("cacheMb", cacheMb).putInt("cacheCeilMb", cacheCeilMb)
-            .putBoolean("cacheDynamic", cacheDynamic)
             .putInt("ioThreads", ioThreads).putInt("threads", threads)
             .putInt("nExpertUsed", nExpertUsed)
             .putInt("nPredict", nPredict).putBoolean("oDirect", oDirect)
-            .putBoolean("overlap", overlap).putBoolean("warmDense", warmDense)
-            .putBoolean("denseOdirect", denseOdirect)
+            .putBoolean("overlap", overlap)
+            .putString("denseWeights", denseWeights.name)
             .putInt("prefetchLayers", prefetchLayers)
             .putBoolean("thinking", thinking)
             .putBoolean("metricsCsv", metricsCsv)
@@ -175,15 +177,22 @@ data class AppSettings(
                 mmap = p.getBoolean("mmap", d.mmap),
                 cacheMb = p.getInt("cacheMb", d.cacheMb),
                 cacheCeilMb = p.getInt("cacheCeilMb", d.cacheCeilMb),
-                cacheDynamic = p.getBoolean("cacheDynamic", d.cacheDynamic),
                 ioThreads = p.getInt("ioThreads", d.ioThreads),
                 threads = p.getInt("threads", d.threads),
                 nExpertUsed = p.getInt("nExpertUsed", d.nExpertUsed),
                 nPredict = p.getInt("nPredict", d.nPredict),
                 oDirect = p.getBoolean("oDirect", d.oDirect),
                 overlap = p.getBoolean("overlap", d.overlap),
-                warmDense = p.getBoolean("warmDense", d.warmDense),
-                denseOdirect = p.getBoolean("denseOdirect", d.denseOdirect),
+                denseWeights = run {
+                    val saved = p.getString("denseWeights", null)
+                    when {
+                        saved != null -> runCatching { DenseWeights.valueOf(saved) }.getOrDefault(d.denseWeights)
+                        // Migrate the old two-boolean prefs from a pre-harmonization install.
+                        p.getBoolean("denseOdirect", false) -> DenseWeights.ANON
+                        !p.getBoolean("warmDense", true) -> DenseWeights.MMAP
+                        else -> DenseWeights.WARM
+                    }
+                },
                 prefetchLayers = p.getInt("prefetchLayers", d.prefetchLayers),
                 thinking = p.getBoolean("thinking", d.thinking),
                 metricsCsv = p.getBoolean("metricsCsv", d.metricsCsv),

@@ -234,7 +234,6 @@ private class Csv(
     fun label(): String {
         if (info.isEmpty()) return ""
         val cache = when {
-            info["cache_dynamic"] == "1" -> "cache ${info["cache_mb"]}→dynamic"
             info["cache_auto"] == "1" -> "cache auto(${info["cache_mb"]})"
             else -> "cache ${info["cache_mb"]}"
         }
@@ -294,7 +293,7 @@ private fun CsvView(file: File, modifier: Modifier) {
                             csv.info["threads"]?.let { "$it threads" },
                             csv.info["n_ctx"]?.let { "ctx $it" },
                             if (csv.info["o_direct"] == "1") "O_DIRECT" else null,
-                            if (csv.info["warm_dense"] == "1") "warm dense" else null,
+                            csv.info["dense_weights"]?.takeIf { csv.info["moe_stream"] == "1" }?.let { "dense=$it" },
                             if (csv.info["force_cache"] == "1") "forced" else null,
                         ).joinToString(" · "),
                         fontSize = 11.sp,
@@ -436,15 +435,14 @@ private val CONFIG_ORDER = listOf(
     "cache_mb" to "Cache budget (MiB)",
     "cache_auto" to "Cache auto-size",
     "cache_ceil_mb" to "Cache ceiling (MiB)",
-    "cache_dynamic" to "Pressure-aware sizing",
     "force_cache" to "Force cache",
     "io_threads" to "I/O lanes",
     "o_direct" to "Direct I/O",
     "overlap" to "I/O–compute overlap",
     "prefetch" to "Temporal prefetch",
-    "warm_dense" to "Dense weight warm-up",
+    "dense_weights" to "Dense weights",
 )
-private val CONFIG_BOOLS = setOf("moe_stream", "cache_auto", "cache_dynamic", "force_cache", "o_direct", "overlap", "warm_dense")
+private val CONFIG_BOOLS = setOf("moe_stream", "cache_auto", "force_cache", "o_direct", "overlap")
 
 private fun prettyConfigValue(key: String, v: String): String = when {
     key in CONFIG_BOOLS -> if (v == "1") "on" else "off"
@@ -722,8 +720,8 @@ private fun pearson(a: List<Float?>, b: List<Float?>): Float? {
 /**
  * N series on one axis, each independently normalized to 0..1. Unlike the two-file compare (one
  * shared scale, because there the magnitudes ARE the comparison), here the magnitudes are unlike by
- * construction — cache_budget in GiB against resident_frac in [0,1] — so each gets its own scale and
- * only the shapes are claimed to line up.
+ * construction — cache_budget in GiB against dense_resident_frac in [0,1] — so each gets its own scale
+ * and only the shapes are claimed to line up.
  */
 @Composable
 private fun MultiLineChart(series: List<List<Float?>>, palette: List<Color>, modifier: Modifier) {

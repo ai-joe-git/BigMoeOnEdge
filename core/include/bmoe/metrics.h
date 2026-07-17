@@ -27,15 +27,11 @@ struct TokenMetrics {
     // (low occupancy ⇒ throttled/preempted, not heavy math). See docs/telemetry.md.
     uint64_t majflt = 0; // major page faults during this decode (backing-store reads)
     double cpu_ms = 0.0; // CPU time summed across all threads during this decode
-    // Fraction of the expert cache's own pages the kernel still had in RAM at the last sample, or -1
-    // when unmeasured (sampler throttled, streaming off, platform can't report). Under 1 the device
-    // is reclaiming the cache mid-run — the pressure --cache-dynamic sizes against. See
-    // docs/pressure.md.
-    double resident_frac = -1.0;
-    // Fraction of the DENSE weights (the mmap'd model) still in RAM, or -1 when unmeasured. The other
-    // half of memory: resident_frac watches the anon cache, this the file-backed weights. Dense
-    // falling while resident_frac holds says the faults are the model, and a smaller cache cannot fix
-    // that. See docs/pressure.md.
+    // Fraction of the DENSE (non-expert) weights the kernel still had in RAM at the last sample, or -1
+    // when unmeasured (throttled, streaming off, or the platform can't report). Under the anon policy
+    // this samples our own buffers (is zram holding them?); under mmap/warm the mmap ranges (is the
+    // kernel dropping the model?). A diagnostic, read alongside `majflt` and the rss split — nothing
+    // acts on it. See docs/pressure.md.
     double dense_resident_frac = -1.0;
     // What those faults actually moved, in MiB (majflt × page size). The same fact as `majflt`, in
     // the unit the rest of this struct is in: 47447 faults is unreadable, 194 MiB re-faulted in one
@@ -57,9 +53,8 @@ struct TokenMetrics {
     double mem_free_mib = 0.0;
     double swap_free_mib = 0.0;
 
-    // The cache budget as of this token. In the summary it is only the last value; per token it is
-    // the governor's trajectory — when it cut, how far, whether it grew back. Without it a run that
-    // "did not work" cannot be told apart from one that never acted.
+    // The cache budget in effect for this token. Fixed for the run now (an explicit --cache-mb, or
+    // what --cache-mb auto sized to once at load) — the runtime governor that moved it is gone.
     double cache_budget_mib = 0.0;
     int turn = 0; // session turn this token belongs to (0 for a one-shot run)
 
@@ -98,18 +93,16 @@ struct RunSummary {
     double majflt_per_token = 0.0;
     double cpu_s_per_token = 0.0;
     double cache_resident_mib = 0.0;
-    double cache_budget_mib = 0.0; // current cache budget (moves under --cache-mb auto/--cache-dynamic)
-    long long cache_resizes = 0;   // runtime budget changes (0 unless auto/dynamic/explicit resize)
+    double cache_budget_mib = 0.0; // the fixed cache budget the run used (explicit, or auto-sized at load)
+    long long cache_resizes = 0;   // runtime budget changes — now only an app's explicit set_cache_budget
 
     // What one token actually demands of the cache, measured: the distinct expert bytes routed per
     // token. A cache below this can hold nothing between tokens; a cache far above it is buying
     // hits from inter-token routing correlation only. Reading it against cache_budget_mib is how a
     // budget stops being a guess. 0 when streaming is off or nothing was routed.
     double token_demand_mib = 0.0;
-    // The widest layer's routed bytes: the mechanical floor the governor may never cut below.
+    // The widest layer's routed bytes: the mechanical floor a cache must be able to stage.
     double layer_demand_mib = 0.0;
-    // Times --cache-dynamic cut the budget because the device was reclaiming the cache (0 when off).
-    long long cache_cuts = 0;
 
     // Temporal prefetch (zero when --prefetch is off): speculative bytes read during generation,
     // experts successfully prefetched, and how many of those a later routing actually used.
@@ -138,14 +131,12 @@ struct RunInfo {
     int cache_mb = 0;
     bool cache_auto = false;
     int cache_ceil_mb = 0;
-    bool cache_dynamic = false;
     bool force_cache = false;
     int io_threads = 0;
     bool o_direct = false;
     bool overlap = false;
     int prefetch_layers = 0;
-    bool warm_dense = false;
-    bool dense_odirect = false;
+    std::string dense_weights = "warm"; // dense (non-expert) policy: "mmap" | "warm" | "anon"
 };
 
 // Optional per-token sink (e.g. CSV for benchmarks). The engine calls on_run_info once before the

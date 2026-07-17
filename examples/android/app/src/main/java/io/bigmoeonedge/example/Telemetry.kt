@@ -20,9 +20,10 @@ data class Telemetry(
     // means a throttled/preempted core. 0 when the platform can't measure them.
     var majflt: Double = 0.0,
     var cpuMs: Double = 0.0,
-    // Fraction of the expert cache still in RAM at the last sample (-1 = unmeasured). Under 1 the
-    // device is reclaiming the cache mid-run: the pressure "Pressure-aware cache sizing" reacts to.
-    var residentFrac: Double = -1.0,
+    // Fraction of the DENSE (non-expert) weights still in RAM at the last sample (-1 = unmeasured).
+    // Diagnostic: under 'anon' it says whether zram is holding them, under mmap/warm whether the
+    // kernel is dropping the model.
+    var denseResidentFrac: Double = -1.0,
     var text: String = "",
     // Aggregate decode rate over the whole run, parsed from the final summary line; -1 until
     // generation finishes. The per-token [tokensPerSecond] is instantaneous (last token only),
@@ -79,7 +80,7 @@ class TelemetryParser {
             current.cacheHitPct = o.optDouble("cache_hit_pct", -1.0)
             current.majflt = o.optDouble("majflt", 0.0)
             current.cpuMs = o.optDouble("cpu_ms", 0.0)
-            current.residentFrac = o.optDouble("resident_frac", -1.0)
+            current.denseResidentFrac = o.optDouble("dense_resident_frac", -1.0)
             current.text = o.optString("text")
         }.isSuccess
     }

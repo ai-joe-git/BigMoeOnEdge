@@ -63,7 +63,8 @@ fun SettingsScreen(current: AppSettings, onChange: (AppSettings) -> Unit, onBack
                 ) { onChange(current.copy(cacheMb = it)) }
                 Text(
                     "Larger cache = fewer flash reads per token, but more RAM — and RAM the kernel takes " +
-                        "back is paid for twice. Auto sizes to free RAM and shrinks under memory pressure. " +
+                        "back is paid for twice. Auto sizes to free RAM once at load, then holds. On a >RAM " +
+                        "model, off is usually the ceiling. " +
                         if (AppSettings.cacheNeedsForce(current.cacheMb))
                             "500 and 1000 are below the engine's floor (--force-cache): a cache under one " +
                                 "token's routed experts can only thrash. Kept for measuring where the cache " +
@@ -77,17 +78,10 @@ fun SettingsScreen(current: AppSettings, onChange: (AppSettings) -> Unit, onBack
                     enabled = stream && current.cacheMb == AppSettings.CACHE_AUTO,
                 ) { onChange(current.copy(cacheCeilMb = it)) }
                 Text(
-                    "Upper bound on the Auto budget, so it does not grow into memory pressure on " +
-                        "devices with tight free RAM.",
+                    "Upper bound on the Auto budget at load, so it does not over-ask on devices with " +
+                        "tight free RAM (MemAvailable counts the model's own weights as free).",
                     fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                SwitchRow(
-                    "Pressure-aware cache sizing",
-                    "Experimental. Treat the cache budget as a ceiling: the engine watches its own pages, " +
-                        "shrinks the cache when the device starts reclaiming it, and grows back when the " +
-                        "pressure lifts. Needs the cache on",
-                    current.cacheDynamic, enabled = stream && cacheOn,
-                ) { onChange(current.copy(cacheDynamic = it)) }
                 IntSetting("Parallel I/O lanes", AppSettings.IO_CHOICES, current.ioThreads, enabled = stream) {
                     onChange(current.copy(ioThreads = it))
                 }
@@ -105,16 +99,16 @@ fun SettingsScreen(current: AppSettings, onChange: (AppSettings) -> Unit, onBack
                     "Read the next experts while the current layer computes, hiding read latency",
                     current.overlap, enabled = stream,
                 ) { onChange(current.copy(overlap = it)) }
-                SwitchRow(
-                    "Dense weight warm-up",
-                    "Page-cache the non-expert weights at load. Removes the slow first tokens on models larger than RAM",
-                    current.warmDense, enabled = stream,
-                ) { onChange(current.copy(warmDense = it)) }
-                SwitchRow(
-                    "Dense via O_DIRECT",
-                    "Experiment: read the dense weights into our own buffers (anon) so a reclaim swaps to zram (fast) instead of a slow flash refault. A/B vs off",
-                    current.denseOdirect, enabled = stream,
-                ) { onChange(current.copy(denseOdirect = it)) }
+                LabeledDropdown(
+                    "Dense weights",
+                    DenseWeights.values().map { it.label },
+                    current.denseWeights.ordinal,
+                    enabled = stream,
+                ) { onChange(current.copy(denseWeights = DenseWeights.values()[it])) }
+                Text(
+                    current.denseWeights.blurb,
+                    fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
                 IntSetting(
                     "Temporal prefetch (layers)", AppSettings.PREFETCH_CHOICES, current.prefetchLayers,
                     format = { if (it == 0) "off" else "$it" },

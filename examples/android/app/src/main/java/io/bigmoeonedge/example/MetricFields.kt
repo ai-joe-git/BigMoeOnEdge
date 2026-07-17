@@ -34,9 +34,8 @@ object MetricFields {
         MetricField("majflt_mib", "faulted MiB", "the same faults as memory: majflt x 4 KiB. Compare directly to read_bytes — reads we chose vs reads the kernel forced", Better.LOWER),
         MetricField("cpu_ms", "CPU used", "CPU time across all threads. Compare to wall_ms x threads: near 100% is compute-bound, far below means throttled or stalled cores", Better.NEUTRAL),
 
-        MetricField("cache_budget_mib", "cache budget", "the expert-cache size this token ran under — the governor's trajectory. Bigger buys hits but risks the reclaim war, so neither direction is simply good", Better.NEUTRAL),
-        MetricField("resident_frac", "cache still in RAM", "fraction of our own cache pages the kernel still had (mincore). 1.0 = all ours, below 0.9 = it is taking it, -1 = not sampled this token", Better.HIGHER),
-        MetricField("dense_resident_frac", "model weights still in RAM", "fraction of the DENSE mmap'd weights still resident (mincore). The half resident_frac misses: if this falls while resident_frac holds, the faults are the model, not the cache — so a smaller cache cannot help. -1 = not sampled", Better.HIGHER),
+        MetricField("cache_budget_mib", "cache budget", "the expert-cache size this run used. Fixed for the run (an explicit --cache-mb, or what auto sized to at load). Bigger buys hits but costs RAM", Better.NEUTRAL),
+        MetricField("dense_resident_frac", "dense weights still in RAM", "fraction of the DENSE (non-expert) weights still resident (mincore). Under 'anon' it samples our own buffers — is zram holding them? Under mmap/warm the mmap — is the kernel dropping the model? Read with majflt. -1 = not sampled", Better.HIGHER),
 
         MetricField("rss_anon_mib", "anon resident = the cache", "resident anonymous memory — where the expert cache lives. Falling while cache_budget holds = the kernel taking it", Better.NEUTRAL),
         MetricField("rss_file_mib", "file resident = the model", "resident file-backed memory: the mmap'd weights. Dropped (not swapped) under pressure, so it never shows in swap", Better.NEUTRAL),
