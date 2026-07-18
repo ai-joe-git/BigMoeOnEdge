@@ -150,7 +150,10 @@ fun SettingsScreen(current: AppSettings, onChange: (AppSettings) -> Unit, onBack
 
             Section("Prompt") {
                 SwitchRow(
-                    "Thinking", "Model reasoning; off passes --no-think (works for Qwen and Gemma)",
+                    "Thinking",
+                    "Let a reasoning model think before answering; its reasoning shows in a " +
+                        "collapsible block above the reply. Off tells the model to skip thinking. " +
+                        "No effect on models that don't reason.",
                     current.thinking,
                 ) { onChange(current.copy(thinking = it)) }
             }

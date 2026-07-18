@@ -26,6 +26,9 @@ data class Telemetry(
     var majflt: Double = 0.0,
     var cpuMs: Double = 0.0,
     var text: String = "",
+    // The thinking span so far when the model is reasoning, kept apart from [text] so the UI can
+    // render it as a distinct block. Empty with thinking off or on a non-reasoning model.
+    var reasoning: String = "",
     // Aggregate decode rate over the whole run, parsed from the final summary line; -1 until
     // generation finishes. The per-token [tokensPerSecond] is instantaneous (last token only),
     // so the UI shows this average once it is available.
@@ -81,6 +84,7 @@ class TelemetryParser {
             current.cacheHitPct = o.optDouble("cache_hit_pct", -1.0)
             current.majflt = o.optDouble("majflt", 0.0)
             current.cpuMs = o.optDouble("cpu_ms", 0.0)
+            current.reasoning = o.optString("reasoning")
             current.text = o.optString("text")
         }.isSuccess
     }

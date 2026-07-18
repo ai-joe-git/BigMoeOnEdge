@@ -209,14 +209,15 @@ class RunService : Service() {
                 main.removeCallbacks(idleUnload)
                 RunBus.update {
                     it.copy(state = EngineState.GENERATING, telemetry = telemetry.current.copy(),
-                        answer = "", summary = "", error = null)
+                        answer = "", reasoning = "", summary = "", error = null)
                 }
                 main.post { notify("Generating…") }
             }
             telemetry.onLine(t) -> {
                 sampleCpuTemp()
                 RunBus.update {
-                    it.copy(telemetry = telemetry.current.copy(), answer = telemetry.current.text)
+                    it.copy(telemetry = telemetry.current.copy(), answer = telemetry.current.text,
+                        reasoning = telemetry.current.reasoning)
                 }
             }
             t.startsWith("BMOE_DONE ") -> onDone(t.removePrefix("BMOE_DONE "))
@@ -246,6 +247,7 @@ class RunService : Service() {
             val ttft = if (loadS >= 0 && prefill >= 0) loadS + prefill else -1.0
             val cancelled = o.optBoolean("cancelled")
             val text = o.optString("text")
+            val reasoning = o.optString("reasoning")
             val loc = java.util.Locale.US
             val summary = buildString {
                 append(String.format(loc, "generation: %d tokens (%.2f tok/s)", tokens, tokS))
@@ -277,12 +279,16 @@ class RunService : Service() {
             )
             RunBus.update {
                 val answer = if (text.isNotEmpty()) text else it.answer
+                // The final BMOE_DONE reasoning may be empty (some models drop it from the summary);
+                // fall back to the last streamed thinking span so the committed turn keeps it.
+                val think = if (reasoning.isNotEmpty()) reasoning else it.reasoning
                 // Commit the assistant turn (skip a cancelled empty turn); the user turn was added on send.
                 val transcript =
-                    if (answer.isNotEmpty() || !cancelled) it.transcript + ChatTurn("assistant", answer, turnMetrics)
+                    if (answer.isNotEmpty() || !cancelled)
+                        it.transcript + ChatTurn("assistant", answer, turnMetrics, think)
                     else it.transcript
-                it.copy(state = EngineState.READY, telemetry = tel, answer = "", summary = summary,
-                    transcript = transcript)
+                it.copy(state = EngineState.READY, telemetry = tel, answer = "", reasoning = "",
+                    summary = summary, transcript = transcript)
             }
         }
         sampleCpuTemp()
