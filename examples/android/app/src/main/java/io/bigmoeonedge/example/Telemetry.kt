@@ -51,6 +51,76 @@ data class Telemetry(
 }
 
 /**
+ * One token's time, split into the three wall-additive terms the panel draws, plus the diagnostics
+ * that explain the compute term. Derived by [breakdown]; see MetricFields for the same contract as
+ * the CSV states it.
+ */
+data class Breakdown(
+    val wallMs: Double,
+    val computeMs: Double,
+    val flashWaitMs: Double,
+    val mgmtMs: Double,
+    /** These are run averages, not the last token — the panel labels them "avg". */
+    val isAverage: Boolean,
+    /** CPU-time ÷ (wall × busy threads), or -1 when the platform couldn't measure it. */
+    val cpuBusyPct: Double,
+    /** Major faults per token, or -1 when unmeasured. */
+    val faultsPerToken: Double,
+) {
+    /** Denominator for the meter bars: the wall time, or the terms themselves before it is known. */
+    val totalMs: Double get() = if (wallMs > 0.0) wallMs else computeMs + flashWaitMs + mgmtMs
+}
+
+/**
+ * Split a token's wall time into compute / flash-wait / cache-mgmt.
+ *
+ * While generating this reads the live last token; once the run has a summary it switches to the
+ * run averages. The two derive the split differently on purpose. Live, flash wait is the MEASURED
+ * wall-additive read term — stall_ms under overlap (the wall time compute sat idle), io_ms in
+ * serial (the blocking read) — and compute is the leftover, which keeps the clamp on compute so a
+ * near-0 compute stays honest instead of being dumped into "flash wait". The end-of-run average
+ * has no per-mode io/stall to read, so it keeps the residual form.
+ *
+ * [busyThreads] must include the I/O lanes under overlap: the CPU numerator is whole-process, so a
+ * denominator that counts only compute threads reads occupancy above 100%.
+ */
+fun breakdown(t: Telemetry, overlap: Boolean, busyThreads: Int): Breakdown {
+    val useAvg = t.avgTokensPerSecond > 0 && t.avgComputeMs >= 0
+    val mgmt = if (useAvg) t.avgMgmtMs.coerceAtLeast(0.0) else t.mgmtMs
+    val wall = if (useAvg) {
+        if (t.avgTokensPerSecond > 0) 1000.0 / t.avgTokensPerSecond else 0.0
+    } else {
+        t.wallMs
+    }
+    val compute: Double
+    val flashWait: Double
+    if (useAvg) {
+        compute = t.avgComputeMs
+        flashWait = (wall - compute - mgmt).coerceAtLeast(0.0)
+    } else {
+        flashWait = if (overlap) t.stallMs else t.ioMs
+        compute = (wall - flashWait - mgmt).coerceAtLeast(0.0)
+    }
+
+    val useAvgCpu = useAvg && t.avgCpuSPerTok >= 0
+    val cpuSPerTok = if (useAvgCpu) t.avgCpuSPerTok else t.cpuMs / 1000.0
+    val cpuBusy = if (cpuSPerTok > 0.0 && wall > 0.0 && busyThreads > 0) {
+        cpuSPerTok / (wall / 1000.0 * busyThreads) * 100.0
+    } else {
+        -1.0
+    }
+    return Breakdown(
+        wallMs = wall,
+        computeMs = compute,
+        flashWaitMs = flashWait,
+        mgmtMs = mgmt,
+        isAverage = useAvg,
+        cpuBusyPct = cpuBusy,
+        faultsPerToken = if (useAvgCpu) t.avgMajfltPerTok else t.majflt,
+    )
+}
+
+/**
  * Incrementally parses the CLI's per-token telemetry contract (see docs/telemetry.md):
  *   BMOE_LOAD     {"mb":..,"ms":..}
  *   BMOE_PROGRESS {"step":..,"steps":..,"wall_ms":..,"io_ms":..,"compute_ms":..,
