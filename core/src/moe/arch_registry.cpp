@@ -32,6 +32,15 @@ static const MoeRecipe k_recipes[] = {
     // the tensor's nb[2], whatever the block layout), so the native MXFP4 layout needs no special
     // handling and the split-layout gate (qwen3moe) already covers this streaming path.
     {"gpt-oss", {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}},
+    // lfm2moe (Liquid AI LFM2/LFM2.5 MoE, e.g. 8B-A1B and 24B-A2B) is a hybrid stack like
+    // qwen35moe — some blocks run attention, others a short-convolution block — and it names its
+    // experts with the standard split suffixes, so streaming is one row. Two structural notes: the
+    // first `<arch>.leading_dense_block_count` blocks are dense and name no expert tensors at all,
+    // so they simply never bind and stay mmap-resident; and the router applies a per-expert bias
+    // (ffn_exp_probs_b) before the top-k, which changes which experts are selected but not the
+    // node the hook reads (ffn_moe_topk). Both lower the streamed fraction relative to a purely
+    // routed model — see docs/limitations.md.
+    {"lfm2moe", {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}},
 };
 
 static const int k_n_recipes = (int) (sizeof(k_recipes) / sizeof(k_recipes[0]));

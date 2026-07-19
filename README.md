@@ -90,6 +90,7 @@ Highlights:
 | `qwen2moe` | Qwen2 MoE family | Same layout as qwen3moe |
 | `gemma4` | Gemma 4 MoE (e.g. 26B-A4B) | Fused expert layout, handled by its registry row |
 | `gpt-oss` | OpenAI gpt-oss-20b / 120b | Purely routed; MXFP4 weights stream unchanged |
+| `lfm2moe` | Liquid AI LFM2 / LFM2.5 MoE (e.g. 8B-A1B) | Hybrid conv/attention stack with leading dense blocks; those stay resident |
 
 Adding an architecture is one row in the registry; expert counts and layouts are discovered from
 the model file at runtime. Procedure: [docs/adding-a-model.md](docs/adding-a-model.md).

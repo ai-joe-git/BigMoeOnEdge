@@ -28,7 +28,13 @@ serial path, and only a single ~25-line hook (with an explicit sunset) for the o
   `gemma4`) stream the routed experts but keep the shared expert — and any dense layers —
   resident (in the page cache, or in the engine's own buffers under `--dense-weights anon`),
   so the streamed fraction (and the memory saving) is smaller than for a purely routed model
-  like `qwen3moe`.
+  like `qwen3moe`. The same applies to architectures whose first blocks are dense by design
+  (`lfm2moe` has a `leading_dense_block_count`): those blocks name no expert tensors, so they
+  are never streamed.
+- **Streaming does not help a model that fits.** The engine's reason to exist is a model
+  larger than RAM. Registering an architecture says the layout streams losslessly, not that
+  streaming is the fast way to run every model using it — a small MoE that fits in memory is
+  faster loaded resident, and the registry rows are about coverage, not a recommendation.
 - **Repack must stay off.** Loading uses `use_extra_bufts=false`; you cannot combine
   streaming with weight repacking.
 - **Windows throughput.** The cache's reserve-then-commit-per-slice path is heavier on
