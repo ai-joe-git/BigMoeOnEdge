@@ -35,7 +35,6 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -460,9 +459,9 @@ private fun AddModelSection(
     var open by rememberSaveable { mutableStateOf<Boolean?>(null) }
     LaunchedEffect(scanning) { if (!scanning && open == null) open = models.isEmpty() }
     val isOpen = open == true
-    // filename -> download id (also the filename). Seeded from WorkManager rather than remembered,
-    // so a transfer started before the app was killed is picked back up instead of running unseen.
-    var downloads by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
+    // The in-flight transfers, by filename. Driven by ModelDownloader's stream rather than
+    // remembered here, so a download started before the app was killed shows up on its own and
+    // finalization/completion is the downloader's business, not this card's.
     var progress by remember { mutableStateOf<Map<String, ModelDownloader.Progress>>(emptyMap()) }
     var importStatus by remember { mutableStateOf<String?>(null) }
     var importFrac by remember { mutableStateOf(-1f) }
@@ -472,9 +471,6 @@ private fun AddModelSection(
     var rowError by remember { mutableStateOf<Pair<String, String>?>(null) }
 
     val present = remember(models) { models.map { it.name }.toSet() }
-    val reseed = { downloads = ModelDownloader.activeDownloads(context) }
-
-    LaunchedEffect(Unit) { reseed() }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
@@ -492,38 +488,15 @@ private fun AddModelSection(
         }
     }
 
-    // Poll the in-flight downloads; finalize each (.part → .gguf) as it lands and re-scan. The
-    // effect restarts whenever the set changes, which is also how it stops.
-    LaunchedEffect(downloads) {
-        if (downloads.isEmpty()) {
-            progress = emptyMap() // clear the last bar once nothing is in flight
-            return@LaunchedEffect
-        }
-        while (true) {
-            val finished = mutableSetOf<String>()
-            val live = mutableMapOf<String, ModelDownloader.Progress>()
-            for ((name, id) in downloads) {
-                val p = ModelDownloader.query(context, id)
-                when {
-                    p == null -> finished += name
-                    p.state == ModelDownloader.State.SUCCESS -> {
-                        ModelDownloader.finalizeDownload(context, name)
-                        finished += name
-                    }
-                    p.state == ModelDownloader.State.FAILED -> {
-                        error = "$name: ${p.reason ?: "download failed"}"
-                        finished += name
-                    }
-                    else -> live[name] = p
-                }
+    // Follow the downloads. A landed one is already finalized (.part → .gguf) by the time it is
+    // reported here, so this only has to re-scan; a failed one names itself in the error line.
+    LaunchedEffect(Unit) {
+        ModelDownloader.events(context).collect { ev ->
+            when (ev) {
+                is ModelDownloader.Event.InFlight -> progress = ev.downloads
+                is ModelDownloader.Event.Completed -> onModelReady()
+                is ModelDownloader.Event.Failed -> error = "${ev.name}: ${ev.reason}"
             }
-            progress = live
-            if (finished.isNotEmpty()) {
-                downloads = downloads - finished
-                onModelReady()
-                break
-            }
-            delay(700)
         }
     }
 
@@ -534,9 +507,9 @@ private fun AddModelSection(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
                     Text("Get a model", fontWeight = FontWeight.SemiBold)
-                    if (!isOpen && downloads.isNotEmpty()) {
+                    if (!isOpen && progress.isNotEmpty()) {
                         Text(
-                            "${downloads.size} downloading…",
+                            "${progress.size} downloading…",
                             fontSize = 12.sp,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -549,7 +522,7 @@ private fun AddModelSection(
                 ModelCatalog.entries.forEach { e ->
                     CatalogRow(
                         entry = e,
-                        status = ModelCatalog.statusOf(e, present, downloads.keys),
+                        status = ModelCatalog.statusOf(e, present, progress.keys),
                         progress = progress[e.fileName],
                         installShown = showInstall == e.fileName,
                         error = rowError?.takeIf { it.first == e.fileName }?.second,
@@ -558,15 +531,11 @@ private fun AddModelSection(
                             error = null
                             rowError = null
                             ModelDownloader.enqueue(context, e.url ?: "", e.fileName, e.approxBytes)
-                                .onSuccess { reseed() }
                                 .onFailure {
                                     rowError = e.fileName to (it.message ?: "download failed to start")
                                 }
                         },
-                        onCancel = {
-                            ModelDownloader.cancel(context, e.fileName)
-                            reseed()
-                        },
+                        onCancel = { ModelDownloader.cancel(context, e.fileName) },
                         onDelete = { deleteTarget = e.fileName },
                     )
                 }
@@ -621,7 +590,6 @@ private fun AddModelSection(
                         onClick = {
                             error = null
                             ModelDownloader.enqueue(context, url)
-                                .onSuccess { reseed() }
                                 .onFailure { error = it.message ?: "invalid URL" }
                         },
                         enabled = url.isNotBlank(),
@@ -635,13 +603,7 @@ private fun AddModelSection(
                 // A pasted URL has no catalog row to show its progress in.
                 progress.filterKeys { k -> ModelCatalog.entries.none { it.fileName == k } }
                     .forEach { (name, p) ->
-                        DownloadProgress(
-                            p,
-                            onCancel = {
-                                ModelDownloader.cancel(context, name)
-                                reseed()
-                            },
-                        )
+                        DownloadProgress(p, onCancel = { ModelDownloader.cancel(context, name) })
                     }
             }
 
@@ -891,55 +853,31 @@ private fun TelemetryCard(ui: UiState, threads: Int, overlap: Boolean, ioThreads
             if (ui.streaming) {
                 // The compute-vs-flash split and cache hit rate only mean anything with the streamer
                 // running. Under mmap the model faults in through the OS page cache, invisible here.
-                // Once done, show the per-token AVERAGE split; while generating, the live last token.
-                val useAvg = done && t.avgComputeMs >= 0
-                val suffix = if (useAvg) " avg" else ""
-                // The wall-additive breakdown: compute + flash-wait + mgmt SUM to the token's wall time,
-                // so tok/s = 1000 / wall is readable straight off the bars.
-                val mgmt = if (useAvg) t.avgMgmtMs.coerceAtLeast(0.0) else t.mgmtMs
-                val wall = if (useAvg) (if (t.avgTokensPerSecond > 0) 1000.0 / t.avgTokensPerSecond else 0.0)
-                           else t.wallMs
-                // Flash wait is the MEASURED wall-additive read term — stall_ms under overlap (the wall
-                // time compute sat idle), io_ms in serial (the blocking read) — and compute is the
-                // leftover. Deriving it this way keeps the clamp on compute (a near-0 compute is honest)
-                // instead of the old wall−compute−mgmt, which silently dumped a clamped-to-0 compute into
-                // "flash wait". The end-of-run average has no per-mode io/stall to read, so it keeps the
-                // residual form.
-                val flashWait: Double
-                val compute: Double
-                if (useAvg) {
-                    compute = t.avgComputeMs
-                    flashWait = (wall - compute - mgmt).coerceAtLeast(0.0)
-                } else {
-                    flashWait = if (overlap) t.stallMs else t.ioMs
-                    compute = (wall - flashWait - mgmt).coerceAtLeast(0.0)
-                }
-                val total = if (wall > 0.0) wall else (compute + flashWait + mgmt)
+                // The split itself — live last token vs run average, and which term is measured
+                // rather than residual — is derived in breakdown(); this only draws it.
+                val b = breakdown(t, overlap, busyThreads = threads + if (overlap) ioThreads else 0)
+                val suffix = if (b.isAverage) " avg" else ""
 
                 // Headline: token time and its inverse, so no mental arithmetic to get tok/s.
-                if (wall > 0.0) {
-                    Text(String.format(Locale.US, "%.0f ms/token  →  %.2f tok/s", wall, 1000.0 / wall),
+                if (b.wallMs > 0.0) {
+                    Text(String.format(Locale.US, "%.0f ms/token  →  %.2f tok/s", b.wallMs, 1000.0 / b.wallMs),
                         fontWeight = FontWeight.SemiBold, fontSize = 15.sp)
                 }
-                MeterRow("compute$suffix", compute, total, MaterialTheme.colorScheme.primary)
-                MeterRow("flash wait$suffix", flashWait, total, MaterialTheme.colorScheme.tertiary)
-                MeterRow("cache mgmt$suffix", mgmt, total, MaterialTheme.colorScheme.secondary)
+                MeterRow("compute$suffix", b.computeMs, b.totalMs, MaterialTheme.colorScheme.primary)
+                MeterRow("flash wait$suffix", b.flashWaitMs, b.totalMs, MaterialTheme.colorScheme.tertiary)
+                MeterRow("cache mgmt$suffix", b.mgmtMs, b.totalMs, MaterialTheme.colorScheme.secondary)
 
-                // Diagnostic line: WHY compute is what it is, plus cache hit. CPU occupancy = CPU-time ÷
-                // (wall × busy threads); near 100% is genuinely compute-bound, well below means a
-                // throttled/preempted core (a frequency cap, a co-resident process). The CPU numerator is
-                // whole-process, so under overlap the I/O lanes count too — the denominator must include
-                // them, or occupancy reads above 100%. Major faults/token > 0 means dense weights
-                // re-faulted from flash inside the decode. Both 0 ⇒ engine couldn't measure.
-                val busyThreads = threads + if (overlap) ioThreads else 0
-                val useAvgCpu = useAvg && t.avgCpuSPerTok >= 0
-                val cpuSTok = if (useAvgCpu) t.avgCpuSPerTok else t.cpuMs / 1000.0
-                val faults = if (useAvgCpu) t.avgMajfltPerTok else t.majflt
+                // Diagnostic line: WHY compute is what it is, plus cache hit. Near 100% busy is
+                // genuinely compute-bound, well below means a throttled/preempted core (a frequency
+                // cap, a co-resident process). Major faults/token > 0 means dense weights re-faulted
+                // from flash inside the decode.
                 val hit = if (t.cacheHitPct >= 0) String.format(Locale.US, "hit %.0f%%", t.cacheHitPct) else "hit —"
                 val diag = buildString {
-                    if (cpuSTok > 0.0 && wall > 0.0 && busyThreads > 0) {
-                        append(String.format(Locale.US, "CPU %.0f%% busy", cpuSTok / (wall / 1000.0 * busyThreads) * 100.0))
-                        if (faults >= 0.0) append(String.format(Locale.US, "  ·  %.0f faults/tok", faults))
+                    if (b.cpuBusyPct >= 0.0) {
+                        append(String.format(Locale.US, "CPU %.0f%% busy", b.cpuBusyPct))
+                        if (b.faultsPerToken >= 0.0) {
+                            append(String.format(Locale.US, "  ·  %.0f faults/tok", b.faultsPerToken))
+                        }
                         append("  ·  ")
                     }
                     append(hit)

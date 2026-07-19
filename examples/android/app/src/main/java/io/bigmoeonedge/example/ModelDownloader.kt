@@ -11,8 +11,11 @@ import androidx.work.WorkInfo
 import androidx.work.WorkManager
 import androidx.work.workDataOf
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 /**
@@ -37,6 +40,17 @@ object ModelDownloader {
         val state: State,
         val reason: String? = null,
     )
+
+    /** What [events] reports. A download ends in exactly one of [Completed] or [Failed]. */
+    sealed interface Event {
+        /** Every transfer still in flight, by filename. Re-emitted on each WorkManager update. */
+        data class InFlight(val downloads: Map<String, Progress>) : Event
+
+        /** [name] landed and is finalized on disk — the caller should re-scan. */
+        data class Completed(val name: String) : Event
+
+        data class Failed(val name: String, val reason: String) : Event
+    }
 
     /**
      * Start a download. Returns the unique-work id (the filename), or an error if the URL doesn't
@@ -81,48 +95,64 @@ object ModelDownloader {
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
-        // Block until the work is persisted so the caller's immediate activeDownloads() reseed
-        // sees it (a fast local DB write) — otherwise the row wouldn't show as downloading.
+        // Block until the work is persisted (a fast local DB write) so the next events() emission
+        // already carries it — otherwise the row wouldn't show as downloading.
         WorkManager.getInstance(ctx).enqueueUniqueWork(name, ExistingWorkPolicy.KEEP, req).result.get()
         name
     }
 
-    /** Current status of a download, or null if it is unknown, cancelled, or already cleared. */
-    suspend fun query(ctx: Context, name: String): Progress? = withContext(Dispatchers.IO) {
-        runCatching {
-            val info = WorkManager.getInstance(ctx).getWorkInfosForUniqueWork(name).get().lastOrNull()
-                ?: return@runCatching null
-            when (info.state) {
-                WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED ->
-                    Progress(name, name, 0, -1, State.PENDING)
-                WorkInfo.State.RUNNING -> Progress(
-                    name, name,
-                    info.progress.getLong(DownloadWorker.KEY_DONE, 0),
-                    info.progress.getLong(DownloadWorker.KEY_TOTAL, -1),
-                    State.RUNNING,
-                )
-                WorkInfo.State.SUCCEEDED -> Progress(name, name, 0, 0, State.SUCCESS)
-                WorkInfo.State.FAILED -> Progress(
-                    name, name, 0, -1, State.FAILED,
-                    info.outputData.getString(DownloadWorker.KEY_ERROR) ?: "download failed",
-                )
-                WorkInfo.State.CANCELLED -> null // user cancelled: no error to surface
-            }
-        }.getOrNull()
-    }
-
     /**
-     * Model downloads still in flight, as filename -> id (both the filename). WorkManager persists
-     * work across process death, so a download started before the app was killed is picked back up
-     * here instead of running unseen. Never throws — an empty map costs a progress bar, not the
-     * whole screen.
+     * Every download's progress and outcome, as a stream. WorkManager's own flow drives it, so the
+     * UI observes instead of polling, and a transfer started before the app was killed reappears on
+     * the first emission rather than running unseen.
+     *
+     * Finalization lives here, not in the observer: a landed download is renamed .part -> .gguf
+     * before [Event.Completed] is emitted, so by the time anyone re-scans the model is on disk under
+     * its final name.
+     *
+     * Work that was ALREADY terminal when collection started is finalized but reported silently: on
+     * a fresh launch WorkManager still holds the last run's succeeded rows, and replaying them would
+     * fire a spurious re-scan for a model the startup scan has already found.
      */
-    fun activeDownloads(ctx: Context): Map<String, String> = runCatching {
-        WorkManager.getInstance(ctx).getWorkInfosByTag(DownloadWorker.TAG).get()
-            .filter { !it.state.isFinished }
-            .mapNotNull { info -> info.tags.firstOrNull { it.startsWith(NAME_TAG_PREFIX) }?.removePrefix(NAME_TAG_PREFIX) }
-            .associateWith { it }
-    }.getOrDefault(emptyMap())
+    fun events(ctx: Context): Flow<Event> = flow {
+        // Terminal work already accounted for, keyed by work id rather than filename: WorkManager
+        // re-emits a finished row on every update, but re-downloading the same model (deleted, then
+        // fetched again) is NEW work with a new id and must still report its own completion.
+        val settled = mutableSetOf<UUID>()
+        var primed = false // has the first (catch-up) emission been processed?
+        WorkManager.getInstance(ctx).getWorkInfosByTagFlow(DownloadWorker.TAG).collect { infos ->
+            val live = mutableMapOf<String, Progress>()
+            val outcomes = mutableListOf<Event>()
+            for (info in infos) {
+                val name = info.tags.firstOrNull { it.startsWith(NAME_TAG_PREFIX) }
+                    ?.removePrefix(NAME_TAG_PREFIX) ?: continue
+                when (info.state) {
+                    WorkInfo.State.ENQUEUED, WorkInfo.State.BLOCKED ->
+                        live[name] = Progress(name, name, 0, -1, State.PENDING)
+                    WorkInfo.State.RUNNING -> live[name] = Progress(
+                        name, name,
+                        info.progress.getLong(DownloadWorker.KEY_DONE, 0),
+                        info.progress.getLong(DownloadWorker.KEY_TOTAL, -1),
+                        State.RUNNING,
+                    )
+                    WorkInfo.State.SUCCEEDED -> if (settled.add(info.id)) {
+                        withContext(Dispatchers.IO) { finalizeDownload(ctx, name) }
+                        if (primed) outcomes += Event.Completed(name)
+                    }
+                    WorkInfo.State.FAILED -> if (settled.add(info.id) && primed) {
+                        outcomes += Event.Failed(
+                            name,
+                            info.outputData.getString(DownloadWorker.KEY_ERROR) ?: "download failed",
+                        )
+                    }
+                    WorkInfo.State.CANCELLED -> settled.add(info.id) // user cancelled: no error to surface
+                }
+            }
+            primed = true
+            outcomes.forEach { emit(it) }
+            emit(Event.InFlight(live))
+        }
+    }
 
     /**
      * Finish a successful download by renaming `<name>.gguf.part` to `<name>.gguf`. The worker
@@ -140,8 +170,8 @@ object ModelDownloader {
 
     /** Cancel a download and delete its leftover .part file. */
     fun cancel(ctx: Context, name: String) {
-        // Block until the cancellation is persisted, so a caller's immediate activeDownloads()
-        // reseed sees the work as finished instead of racing it back in as still-active.
+        // Block until the cancellation is persisted, so the next events() emission reports the work
+        // as finished instead of racing it back in as still-active.
         WorkManager.getInstance(ctx).cancelUniqueWork(name).result.get()
         File(ModelManager.internalModelsDir(ctx), name + DownloadWorker.PART_SUFFIX).delete()
     }
