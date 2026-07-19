@@ -12,6 +12,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.DragInteraction
 import androidx.compose.foundation.layout.*
@@ -157,8 +158,10 @@ private fun MainScreen(
     var prompt by rememberSaveable { mutableStateOf("Explain what a mixture-of-experts model is, in two sentences.") }
     val listState = rememberLazyListState()
 
-    // Item 0 is the controls block; the transcript and the in-flight answer follow it.
-    val liveShown = ui.answer.isNotEmpty()
+    // Item 0 is the controls block; the transcript and the in-flight answer follow it. The live
+    // turn also shows while only reasoning has streamed (the thinking phase, before any answer),
+    // so a Thinking-on run does not sit on a blank screen while the model reasons.
+    val liveShown = ui.answer.isNotEmpty() || ui.reasoning.isNotEmpty()
     val total = 1 + ui.transcript.size + (if (liveShown) 1 else 0)
 
     // Follow the tail only while the user is parked at the bottom. A long answer streams for a
@@ -181,7 +184,7 @@ private fun MainScreen(
     LaunchedEffect(listState) {
         snapshotFlow { listState.isScrollInProgress }.collect { scrolling -> if (!scrolling) followTail = atBottom }
     }
-    LaunchedEffect(total, ui.answer.length, followTail) {
+    LaunchedEffect(total, ui.answer.length, ui.reasoning.length, followTail) {
         // A long answer is taller than the viewport, so aligning the item's top would park the view
         // on its beginning; the large offset pins the list to the newest text instead.
         if (followTail && total > 1) runCatching { listState.scrollToItem(total - 1, Int.MAX_VALUE) }
@@ -323,9 +326,10 @@ private fun MainScreen(
             items(ui.transcript.size) { i -> TurnView(ui.transcript[i]) }
 
             // The in-flight assistant answer as it streams (its user turn is already in the transcript).
+            // While generating, keep the thinking block open so the reasoning is visible as it arrives.
             if (liveShown) {
                 item(key = "live") {
-                    TurnView(ChatTurn("assistant", ui.answer))
+                    TurnView(ChatTurn("assistant", ui.answer, reasoning = ui.reasoning), reasoningExpanded = true)
                 }
             }
         }
@@ -341,9 +345,14 @@ private fun MainScreen(
     }
 }
 
-/** One transcript bubble: a small role label and the message, with an optional metrics line. */
+/**
+ * One transcript bubble: a small role label and the message, with an optional metrics line and,
+ * for a reasoning model, a collapsible thinking block above the answer. [reasoningExpanded] seeds
+ * the block open (used for the in-flight turn, so the reasoning is visible as it streams); committed
+ * turns default it closed so the transcript stays readable.
+ */
 @Composable
-private fun TurnView(turn: ChatTurn) {
+private fun TurnView(turn: ChatTurn, reasoningExpanded: Boolean = false) {
     val isUser = turn.role == "user"
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Text(
@@ -351,6 +360,7 @@ private fun TurnView(turn: ChatTurn) {
             fontSize = 12.sp, fontWeight = FontWeight.Bold,
             color = if (isUser) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary,
         )
+        if (turn.reasoning.isNotEmpty()) ReasoningBlock(turn.reasoning, reasoningExpanded)
         // The user's own prompt is echoed verbatim; only the model's answer is read as Markdown.
         SelectionContainer {
             if (isUser) Text(turn.text, fontSize = 15.sp) else MarkdownText(turn.text)
@@ -358,6 +368,48 @@ private fun TurnView(turn: ChatTurn) {
         if (turn.metrics.isNotEmpty()) {
             Text(turn.metrics, fontFamily = FontFamily.Monospace, fontSize = 11.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+/**
+ * The model's internal reasoning, rendered as a dimmed, collapsible block distinct from the answer.
+ * A thinking model spends its first tokens here; surfacing it (instead of dropping it, or worse,
+ * letting it leak into the answer) is what makes a Thinking-on run legible while it reasons. Tapping
+ * the header toggles it; [initiallyExpanded] is the starting state.
+ */
+@Composable
+private fun ReasoningBlock(reasoning: String, initiallyExpanded: Boolean) {
+    var expanded by rememberSaveable { mutableStateOf(initiallyExpanded) }
+    Surface(
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        shape = MaterialTheme.shapes.small,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded },
+            ) {
+                Text(
+                    "Thinking", fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    if (expanded) "▾" else "▸", fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (expanded) {
+                SelectionContainer {
+                    Text(
+                        reasoning, fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 4.dp),
+                    )
+                }
+            }
         }
     }
 }

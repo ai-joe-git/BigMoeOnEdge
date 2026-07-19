@@ -12,14 +12,19 @@ import kotlinx.coroutines.flow.update
  */
 enum class EngineState { IDLE, LOADING, READY, GENERATING, ERROR }
 
-/** One committed message in the multi-turn transcript. metrics is a compact per-turn line. */
-data class ChatTurn(val role: String, val text: String, val metrics: String = "")
+/**
+ * One committed message in the multi-turn transcript. metrics is a compact per-turn line.
+ * reasoning is the model's thinking span (assistant turns only), shown as a collapsible block
+ * above the answer; empty when the model did not reason.
+ */
+data class ChatTurn(val role: String, val text: String, val metrics: String = "", val reasoning: String = "")
 
 /** Immutable snapshot of the session + current generation, observed by the Compose UI. */
 data class UiState(
     val state: EngineState = EngineState.IDLE,
     val telemetry: Telemetry = Telemetry(),
     val answer: String = "",
+    val reasoning: String = "",      // in-flight thinking span; streams before the answer while the model reasons
     val summary: String = "",
     val error: String? = null,
     val ioMode: String? = null,     // effective read mode reported by the engine (direct / buffered)
@@ -45,7 +50,7 @@ object RunBus {
 
     /** Reset the per-generation fields for a new prompt, preserving session state and signature. */
     fun resetGeneration() = _state.update {
-        it.copy(telemetry = Telemetry(), answer = "", summary = "", error = null)
+        it.copy(telemetry = Telemetry(), answer = "", reasoning = "", summary = "", error = null)
     }
 
     fun setState(s: EngineState) = _state.update { it.copy(state = s) }
