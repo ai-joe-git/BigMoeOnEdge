@@ -15,9 +15,13 @@
 //      that matters: an opened-and-not-closed span is the opposite request, and it is exactly what
 //      asking for an AUTO continuation would silently produce.
 //
-// Nothing here hardcodes a marker for any family. The expected shapes are derived from the
-// thinking-on render of the same template, so a submodule bump that changes a family's markers
-// updates the expectations with it instead of breaking the test.
+// This file does name `<think>`, in the LFM2.5 case only, because a test of a specific template is
+// entitled to state what that template's span looks like. The ENGINE names no marker for any
+// family: everything it emits comes from llama.cpp's handler for the loaded model, and every
+// decision it makes reads model-supplied data (`thinking_start_tag`/`thinking_end_tag`). The
+// gpt-oss expectations below take the harder route and are derived from that template's own
+// thinking-on render, so a submodule bump that changes harmony's channel markers updates them with
+// it instead of breaking the test.
 //
 // Assertions are explicit (not <cassert>) because the Release gates build with NDEBUG, which
 // would compile assert() out.
