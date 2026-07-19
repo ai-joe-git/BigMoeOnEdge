@@ -2,7 +2,7 @@
 
 **Run Mixture-of-Experts models far bigger than your edge device's RAM.**
 
-> **The result: a ~60 GB model on a 12 GB phone — 1.3 tok/s lossless, byte-identical to running
+> **The result: a ~60 GB model on a 12 GB phone: 1.3 tok/s lossless, byte-identical to running
 > from RAM, 2.2 tok/s with one speed knob. CPU-only, on stock llama.cpp.**
 
 A Mixture-of-Experts (MoE) model is made of many small "experts", and each generated token only
