@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
-## [Unreleased]
+## [0.13.1] - 2026-07-19
 
 ### Fixed
 - **A non-reasoning model is no longer told it "always reasons."** `think_ctl` reported `none` for
