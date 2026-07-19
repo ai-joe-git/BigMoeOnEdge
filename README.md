@@ -32,21 +32,7 @@ policy and the read/compute overlap all have to earn their keep.
 
 Streaming does not change what the model computes: the output is **byte-for-byte identical** to
 running the model fully in RAM. Same weights, same math, just fetched later. There is exactly one
-optional lossy setting, and it's always labelled as such. That claim is not asserted, it's gated:
-the `moe_gates` tests decode the same model streamed and fully resident and compare the outputs
-byte for byte, and they must pass before anything merges. A run on this commit:
-
-```text
-$ ctest --output-on-failure
-1/6 Test #1: chat_parse .......................   Passed    0.34 sec
-2/6 Test #2: config_validate ..................   Passed    0.08 sec
-3/6 Test #3: moe_make_tiny_model_qwen3moe .....   Passed    0.46 sec
-4/6 Test #4: moe_gates_qwen3moe ...............   Passed    3.68 sec
-5/6 Test #5: moe_make_tiny_model_gemma4 .......   Passed    0.40 sec
-6/6 Test #6: moe_gates_gemma4 .................   Passed    1.91 sec
-
-100% tests passed, 0 tests failed out of 6
-```
+optional lossy setting, and it's always labelled as such.
 
 Everything runs on **stock llama.cpp**. Upstream stays untouched, tracked as a plain submodule, and
 the streaming works through its public API, so following new llama.cpp releases is a routine
