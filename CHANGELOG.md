@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
+## [0.13.2] - 2026-07-20
+
+### Fixed
+- **An explicitly passed flag now really does beat the environment variable.** `bmoe-cli` documents
+  that a flag always wins over the matching `BMOE_*` override, but it decided "was this flag passed?"
+  by asking whether the field still held its default. So `--cache-mb 0` (cache deliberately off),
+  `--io-threads 4`, `--prefetch 0` and `--n-expert-used 0` were indistinguishable from an untouched
+  config and got overridden anyway — the app passes two of those explicitly. The CLI now records
+  which flags were typed and consults that, so passing a flag its default value is still a choice
+  the engine honours. Values arriving from the environment are validated exactly as before.
+
 ## [0.13.1] - 2026-07-19
 
 ### Fixed
