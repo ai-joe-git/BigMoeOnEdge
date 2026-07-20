@@ -3,7 +3,7 @@
 **Run Mixture-of-Experts models far bigger than your edge device's RAM.**
 
 > **The result: a ~60 GB model on a 12 GB phone: 1.3 tok/s lossless, byte-identical to running
-> from RAM, 2.2 tok/s with one speed knob. CPU-only, on stock llama.cpp.**
+> from RAM, 2.2 tok/s with one speed knob. CPU-only, through llama.cpp's public API.**
 
 A Mixture-of-Experts (MoE) model is made of many small "experts", and each generated token only
 uses a few of them. BigMoeOnEdge takes that literally: it keeps the small always-needed parts of
@@ -30,9 +30,12 @@ phone's flash storage, and nothing else. The entire budget is a phone's UFS stor
 the bandwidth a desktop NVMe drive offers, which is exactly why the expert cache, the dense-weight
 policy and the read/compute overlap all have to earn their keep.
 
-Everything runs on **stock llama.cpp**. Upstream stays untouched, tracked as a plain submodule, and
-the streaming works through its public API, so following new llama.cpp releases is a routine
-submodule bump, not a merge.
+The streaming path works entirely through llama.cpp's **public API**, so following new llama.cpp
+releases is a routine submodule bump, not a merge. The one exception is the optional `--overlap`
+flag, which needs a per-expert wait point inside the CPU MoE kernel that no public API exposes: it
+carries a single ~25-line hook, as one commit on the fork branch `bmoe/expert-ready-hook`. The hook
+is zero-cost when unregistered, everything else builds against stock upstream, and it is dropped the
+moment upstream ships an equivalent. Details in [docs/seam.md](docs/seam.md).
 
 Highlights:
 
@@ -60,7 +63,8 @@ Highlights:
 > flash*, FlexGen, PowerInfer and EdgeMoE, not a novel technique. The closest recent work is
 > [flash-moe](https://github.com/danveloper/flash-moe): a purpose-built Metal engine that streams a
 > 397B MoE from SSD on Apple Silicon, and on an iPhone through a community fork. BigMoeOnEdge takes
-> the other side of that problem: CPU-only, on Android, on stock llama.cpp, across architectures.
+> the other side of that problem: CPU-only, on Android, on llama.cpp's public API (bar one optional
+> ~25-line hook, above), across architectures.
 > See [docs/limitations.md](docs/limitations.md).
 
 ## Try it on your phone
