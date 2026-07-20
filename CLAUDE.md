@@ -45,6 +45,13 @@ we do not fork llama.cpp. See `docs/architecture.md` and `docs/seam.md`.
    columns or the `BMOE_*` protocol change, `docs/roadmap.md` when a listed future item
    ships, and `examples/android/README.md` when the catalog, settings or build flow change.
    Docs that name a file the code no longer has are worse than no docs.
+7. **Review exactly what is being published, every time.** This repo is public and every push
+   is permanent record. Before any commit, push, PR or release: run `git status --short` and
+   stage by explicit path only — never `git add -A` / `git add .`; untracked files in the
+   working tree are not yours to publish. Logs, CSVs and bench evidence get a scan for
+   identifying data (device model codes, local paths, addresses) before landing in `docs/`;
+   phrase the test device generically. After a squash-merge, verify the landed tree
+   (`git ls-tree`) before pushing anything else.
 
 ## Build and test
 
