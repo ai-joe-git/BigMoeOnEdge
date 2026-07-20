@@ -46,7 +46,7 @@ For the far end of the ratio — a 58 GB model at 5.2× device RAM — see
 
 | | |
 |---|---|
-| Device | OnePlus 15R (`CPH2769`), Android 16 |
+| Device | OnePlus 15R, Android 16 |
 | SoC / cores | Snapdragon-class, 8 cores, `arm64-v8a` |
 | RAM | 11.3 GB (`MemTotal` 11 366 276 kB) |
 | Storage | UFS 4.x, models read from `/sdcard/Download` (O_DIRECT verified working) |
