@@ -4,7 +4,7 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 Semantic Versioning.
 
-## [Unreleased]
+## [0.15.0] - 2026-07-23
 
 ### Added
 - **`--drop-cold-experts F` — cache-aware expert dropping.** Skips a
@@ -79,6 +79,15 @@ Semantic Versioning.
   check cannot distinguish a moved drop rate from a contaminated cell.
 - `scripts/route-analyze.py` reports when a trace was recorded with dropping on, so its
   working-set figures are not misread as flash traffic.
+- README: the two quality-trading knobs (turbo top-k and cache-aware dropping) are now one
+  Features bullet and one section, **Trading quality for speed**, instead of two long bullets and
+  a top-k-only section — same numbers and caveats, said once.
+
+### Fixed
+- `validate()` now rejects a NaN `--drop-cold-experts` threshold instead of accepting it and
+  silently arming nothing: the range check is written as a negated inclusive range, since NaN
+  compares false against every bound and slipped past both the `[0, 1]` check and the
+  cache-required check. Found by a release audit; covered in `tests/config_test.cpp`.
 
 ## [0.14.0] - 2026-07-21
 
